@@ -1,0 +1,18 @@
+# Environment files - never commit these
+backend/.env
+frontend/.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Node
+frontend/node_modules/
+
+# Airflow
+airflow_home/
+
+# OS
+.DS_Store
+Thumbs.db
