@@ -31,8 +31,6 @@ async def lifespan(app: FastAPI):
     log.info("api_started")
     yield
     await orchestrator.stop()
-    if db._pool:
-        await db._pool.close()
 
 
 app = FastAPI(title="Pipeline Autopilot API", lifespan=lifespan)
@@ -71,79 +69,52 @@ async def get_playbook():
 @api.get("/pipelines")
 async def list_pipelines():
     pool = await db.get_pool()
-    result = []
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT id, dag_id, name, layer, description, status, schedule, next_run FROM public.pipelines ORDER BY name")
-            pipelines = await cur.fetchall()
-            for p in pipelines:
-                pid, dag_id, name, layer, desc, status, schedule, next_run = p
-                await cur.execute(
-                    "SELECT status, started_at, finished_at, rows_processed, rows_quarantined, run_id FROM public.pipeline_runs WHERE dag_id=%s ORDER BY started_at DESC LIMIT 1",
-                    (dag_id,))
-                last = await cur.fetchone()
-                await cur.execute("SELECT count(*) FROM public.pipeline_runs WHERE dag_id=%s", (dag_id,))
-                total = (await cur.fetchone())[0]
-                await cur.execute(
-                    "SELECT count(*) FROM public.audit_log WHERE pipeline_id=%s AND status='pending_approval'",
-                    (pid,))
-                needs = (await cur.fetchone())[0]
-                result.append({
-                    "id": pid, "dag_id": dag_id, "name": name, "layer": layer,
-                    "description": desc, "status": status, "schedule": schedule,
-                    "next_run": next_run.isoformat() if next_run else None,
-                    "last_run": {
-                        "status": last[0], "started_at": last[1].isoformat() if last[1] else None,
-                        "finished_at": last[2].isoformat() if last[2] else None,
-                        "rows_processed": last[3], "rows_quarantined": last[4], "run_id": last[5]
-                    } if last else None,
-                    "total_runs": total,
-                    "needs_approval": bool(needs),
-                })
-    return result
+    async with pool.acquire() as conn:
+        pipelines = await conn.fetch("SELECT * FROM public.pipelines ORDER BY name")
+        result = []
+        for p in pipelines:
+            last = await conn.fetchrow(
+                """SELECT status, started_at, finished_at, rows_processed, rows_quarantined, run_id
+                   FROM public.pipeline_runs WHERE dag_id=$1 ORDER BY started_at DESC LIMIT 1""",
+                p["dag_id"])
+            pending = await conn.fetchval(
+                "SELECT count(*) FROM public.pipeline_runs WHERE dag_id=$1", p["dag_id"])
+            needs = await conn.fetchval(
+                "SELECT count(*) FROM public.audit_log WHERE pipeline_id=$1 AND status='pending_approval'",
+                p["id"])
+            item = dict(p)
+            item["last_run"] = _row(last)
+            item["total_runs"] = pending
+            item["needs_approval"] = bool(needs)
+            result.append(item)
+        return result
 
 
 @api.get("/pipelines/{pipeline_id}")
 async def get_pipeline(pipeline_id: str):
     pool = await db.get_pool()
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT id, dag_id, name, layer, description, status, schedule, next_run FROM public.pipelines WHERE id=%s", (pipeline_id,))
-            p = await cur.fetchone()
-            if p is None:
-                raise HTTPException(404, "pipeline not found")
-            await cur.execute(
-                "SELECT id, dag_id, run_id, status, started_at, finished_at, rows_processed, rows_quarantined FROM public.pipeline_runs WHERE dag_id=%s ORDER BY started_at DESC LIMIT 15",
-                (p[1],))
-            runs = await cur.fetchall()
-    return {
-        "id": p[0], "dag_id": p[1], "name": p[2], "layer": p[3],
-        "description": p[4], "status": p[5], "schedule": p[6],
-        "next_run": p[7].isoformat() if p[7] else None,
-        "runs": [{"id": str(r[0]), "dag_id": r[1], "run_id": r[2], "status": r[3],
-                  "started_at": r[4].isoformat() if r[4] else None,
-                  "finished_at": r[5].isoformat() if r[5] else None,
-                  "rows_processed": r[6], "rows_quarantined": r[7]} for r in runs]
-    }
+    async with pool.acquire() as conn:
+        p = await conn.fetchrow("SELECT * FROM public.pipelines WHERE id=$1", pipeline_id)
+        if p is None:
+            raise HTTPException(404, "pipeline not found")
+        runs = await conn.fetch(
+            """SELECT * FROM public.pipeline_runs WHERE dag_id=$1 ORDER BY started_at DESC LIMIT 15""",
+            p["dag_id"])
+        item = dict(p)
+        item["runs"] = [dict(r) for r in runs]
+        return item
 
 
 @api.get("/pipelines/{pipeline_id}/failures")
 async def get_failures(pipeline_id: str):
     pool = await db.get_pool()
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("""
-                SELECT id, pipeline_id, error_type, description, proposed_fix, auto_fixable,
-                       status, approved_by, outcome, created_at, resolved_at
-                FROM public.audit_log
-                WHERE pipeline_id=%s AND status='pending_approval'
-                ORDER BY created_at DESC
-            """, (pipeline_id,))
-            rows = await cur.fetchall()
-    return [{"id": str(r[0]), "pipeline_id": r[1], "error_type": r[2], "description": r[3],
-             "proposed_fix": r[4], "auto_fixable": r[5], "status": r[6], "approved_by": r[7],
-             "outcome": r[8], "created_at": r[9].isoformat() if r[9] else None,
-             "resolved_at": r[10].isoformat() if r[10] else None} for r in rows]
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT * FROM public.audit_log
+               WHERE pipeline_id=$1 AND status='pending_approval'
+               ORDER BY created_at DESC""",
+            pipeline_id)
+        return [dict(r) for r in rows]
 
 
 @api.post("/pipelines/{pipeline_id}/approve")
@@ -171,49 +142,36 @@ async def get_audit(
     pool = await db.get_pool()
     clauses, args = [], []
     if pipeline_id:
-        args.append(pipeline_id)
-        clauses.append(f"pipeline_id=%s")
+        args.append(pipeline_id); clauses.append(f"pipeline_id=${len(args)}")
     if status:
-        args.append(status)
-        clauses.append(f"status=%s")
+        args.append(status); clauses.append(f"status=${len(args)}")
     if since:
         try:
             dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
         except ValueError:
             raise HTTPException(400, "invalid 'since' timestamp")
-        args.append(dt)
-        clauses.append(f"created_at >= %s")
+        args.append(dt); clauses.append(f"created_at >= ${len(args)}")
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                f"SELECT id, pipeline_id, error_type, description, proposed_fix, auto_fixable, status, approved_by, outcome, created_at, resolved_at FROM public.audit_log {where} ORDER BY created_at DESC LIMIT 500",
-                args)
-            rows = await cur.fetchall()
-    return [{"id": str(r[0]), "pipeline_id": r[1], "error_type": r[2], "description": r[3],
-             "proposed_fix": r[4], "auto_fixable": r[5], "status": r[6], "approved_by": r[7],
-             "outcome": r[8], "created_at": r[9].isoformat() if r[9] else None,
-             "resolved_at": r[10].isoformat() if r[10] else None} for r in rows]
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT * FROM public.audit_log {where} ORDER BY created_at DESC LIMIT 500", *args)
+        return [dict(r) for r in rows]
 
 
 @api.get("/pipelines/{pipeline_id}/lineage")
 async def get_lineage(pipeline_id: str):
     pool = await db.get_pool()
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            counts = {}
-            for tbl in ["bronze.raw_orders", "bronze.raw_customers", "bronze.raw_products",
-                        "silver.orders_clean", "silver.customers_clean",
-                        "gold.daily_revenue", "gold.customer_segments"]:
-                try:
-                    await cur.execute(f"SELECT count(*) FROM {tbl}")
-                    row = await cur.fetchone()
-                    counts[tbl] = row[0] if row else 0
-                except Exception:
-                    counts[tbl] = 0
-            await cur.execute("SELECT status FROM public.pipelines WHERE id=%s", (pipeline_id,))
-            pipe = await cur.fetchone()
-    health = pipe[0] if pipe else "healthy"
+    async with pool.acquire() as conn:
+        counts = {}
+        for tbl in ["bronze.raw_orders", "bronze.raw_customers", "bronze.raw_products",
+                    "silver.orders_clean", "silver.customers_clean",
+                    "gold.daily_revenue", "gold.customer_segments"]:
+            try:
+                counts[tbl] = await conn.fetchval(f"SELECT count(*) FROM {tbl}")
+            except Exception:
+                counts[tbl] = 0
+        pipe = await conn.fetchrow("SELECT status FROM public.pipelines WHERE id=$1", pipeline_id)
+    health = pipe["status"] if pipe else "healthy"
 
     def node(nid, label, table, layer, x, y):
         return {"id": nid, "label": label, "rows": counts.get(table, 0), "layer": layer,
