@@ -3,11 +3,8 @@ from __future__ import annotations
 import asyncio
 import random
 import uuid
-import smtplib
 import os
 from datetime import datetime, timezone
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 import structlog
 
@@ -17,8 +14,6 @@ from ws_manager import manager
 
 log = structlog.get_logger(__name__)
 
-GMAIL_USER = os.getenv("GMAIL_USER", "")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
 ALERT_EMAIL = os.getenv("ALERT_EMAIL", "")
 APP_URL = os.getenv("APP_URL", "http://localhost:3000")
 
@@ -39,7 +34,8 @@ def set_alerts_enabled(value: bool) -> None:
 
 
 def _send_email(pipeline_name, pipeline_id, error_type, description, proposed_fix, severity):
-    if not GMAIL_USER or not GMAIL_APP_PASSWORD or not ALERT_EMAIL:
+    api_key = os.getenv("RESEND_API_KEY", "")
+    if not api_key or not ALERT_EMAIL:
         return
     severity_emoji = "🔴" if severity == "critical" else "⚠️"
     pipeline_url = f"{APP_URL}/pipeline/{pipeline_id}"
@@ -80,16 +76,14 @@ def _send_email(pipeline_name, pipeline_id, error_type, description, proposed_fi
     </div>
     """
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = GMAIL_USER
-        msg["To"] = ALERT_EMAIL
-        msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_USER, ALERT_EMAIL, msg.as_string())
+        import resend
+        resend.api_key = api_key
+        resend.Emails.send({
+            "from": "Pipeline Autopilot <onboarding@resend.dev>",
+            "to": ALERT_EMAIL,
+            "subject": subject,
+            "html": html,
+        })
         log.info("alert_email_sent", pipeline=pipeline_id)
     except Exception as e:
         log.error("email_send_failed", error=str(e))
