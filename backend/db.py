@@ -1,6 +1,7 @@
 """PostgreSQL access layer + schema bootstrap + synthetic Olist seed data."""
 from __future__ import annotations
 import os
+import ssl
 import random
 from datetime import datetime, timezone, timedelta
 
@@ -141,7 +142,17 @@ async def get_pool() -> asyncpg.Pool:
 
 async def init_db() -> None:
     global _pool
-    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    _pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=10,
+        ssl=ssl_ctx
+    )
     async with _pool.acquire() as conn:
         await conn.execute(SCHEMA_DDL)
         for p in PIPELINES:
@@ -185,7 +196,6 @@ async def _seed_data() -> None:
         await conn.executemany(
             "INSERT INTO bronze.raw_orders VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING", orders)
 
-        # silver (cleaned = non-canceled with valid price)
         await conn.execute("""
             INSERT INTO silver.orders_clean
             SELECT order_id, customer_id, order_status, purchase_timestamp, price
@@ -195,7 +205,6 @@ async def _seed_data() -> None:
             SELECT customer_id, customer_city, customer_state, zip_code
             FROM bronze.raw_customers ON CONFLICT DO NOTHING""")
 
-        # gold aggregates
         await conn.execute("""
             INSERT INTO gold.daily_revenue (revenue_date, total_revenue, order_count)
             SELECT date_trunc('day', purchase_timestamp)::date, sum(price), count(*)
