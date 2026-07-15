@@ -94,50 +94,45 @@ def _send_email(pipeline_name, pipeline_id, error_type, description, proposed_fi
 
 
 async def _has_open_failure(conn, pipeline_id: str) -> bool:
-    async with conn.cursor() as cur:
-        await cur.execute(
-            "SELECT count(*) FROM public.audit_log WHERE pipeline_id=%s AND status='pending_approval'",
-            (pipeline_id,)
-        )
-        row = await cur.fetchone()
-        return bool(row and row[0])
+    row = await conn.fetchval(
+        "SELECT count(*) FROM public.audit_log WHERE pipeline_id=$1 AND status='pending_approval'",
+        pipeline_id,
+    )
+    return bool(row)
 
 
 async def _record_run(conn, dag_id: str, status: str, rows: int, quarantined: int) -> str:
     run_id = f"manual__{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{random.randint(100,999)}"
-    async with conn.cursor() as cur:
-        await cur.execute("""
-            INSERT INTO public.pipeline_runs (dag_id, run_id, status, started_at, finished_at, rows_processed, rows_quarantined)
-            VALUES (%s,%s,%s, now() - interval '4 seconds', now(), %s, %s)
-        """, (dag_id, run_id, status, rows, quarantined))
+    await conn.execute(
+        """INSERT INTO public.pipeline_runs (dag_id, run_id, status, started_at, finished_at, rows_processed, rows_quarantined)
+           VALUES ($1,$2,$3, now() - interval '4 seconds', now(), $4, $5)""",
+        dag_id, run_id, status, rows, quarantined,
+    )
     return run_id
 
 
 async def _open_failure(conn, pipeline_id: str, error_type: str) -> dict:
     info = classify_error(error_type)
-    async with conn.cursor() as cur:
-        await cur.execute("""
-            INSERT INTO public.audit_log (pipeline_id, error_type, description, proposed_fix, auto_fixable, status)
-            VALUES (%s,%s,%s,%s,%s,'pending_approval') RETURNING id
-        """, (pipeline_id, error_type, info["description"], info["proposed_fix"], info["auto_fixable"]))
-        row = await cur.fetchone()
-        audit_id = str(row[0])
-    return {"audit_id": audit_id, **info}
+    audit_id = await conn.fetchval(
+        """INSERT INTO public.audit_log (pipeline_id, error_type, description, proposed_fix, auto_fixable, status)
+           VALUES ($1,$2,$3,$4,$5,'pending_approval') RETURNING id""",
+        pipeline_id, error_type, info["description"], info["proposed_fix"], info["auto_fixable"],
+    )
+    return {"audit_id": str(audit_id), **info}
 
 
 async def _set_status(conn, pipeline_id: str, status: str, next_run: bool = True) -> None:
-    async with conn.cursor() as cur:
-        if next_run:
-            await cur.execute(
-                "UPDATE public.pipelines SET status=%s, next_run=now() + interval '1 hour' WHERE id=%s",
-                (status, pipeline_id))
-        else:
-            await cur.execute("UPDATE public.pipelines SET status=%s WHERE id=%s", (status, pipeline_id))
+    if next_run:
+        await conn.execute(
+            "UPDATE public.pipelines SET status=$2, next_run=now() + interval '1 hour' WHERE id=$1",
+            pipeline_id, status)
+    else:
+        await conn.execute("UPDATE public.pipelines SET status=$2 WHERE id=$1", pipeline_id, status)
 
 
 async def run_once(pipeline: dict) -> None:
     pool = await get_pool()
-    async with pool.connection() as conn:
+    async with pool.acquire() as conn:
         if await _has_open_failure(conn, pipeline["id"]):
             return
 
@@ -150,7 +145,6 @@ async def run_once(pipeline: dict) -> None:
             failure = await _open_failure(conn, pipeline["id"], error_type)
             new_status = "critical" if not failure["auto_fixable"] else "warning"
             await _set_status(conn, pipeline["id"], new_status, next_run=False)
-            await conn.commit()
             log.warning("pipeline_failed", pipeline=pipeline["id"], error=error_type)
             await manager.broadcast("pipeline_failed", {
                 "pipeline_id": pipeline["id"], "status": new_status, **failure,
@@ -166,7 +160,6 @@ async def run_once(pipeline: dict) -> None:
             rows = random.randint(800, 1200)
             run_id = await _record_run(conn, pipeline["dag_id"], "success", rows, 0)
             await _set_status(conn, pipeline["id"], "healthy")
-            await conn.commit()
             await manager.broadcast("pipeline_success", {
                 "pipeline_id": pipeline["id"], "status": "healthy",
                 "rows_processed": rows, "run_id": run_id,
@@ -175,23 +168,19 @@ async def run_once(pipeline: dict) -> None:
 
 async def approve_fix(pipeline_id: str, audit_id: str, approved_by: str) -> dict:
     pool = await get_pool()
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT * FROM public.audit_log WHERE id=%s", (uuid.UUID(audit_id),))
-            audit = await cur.fetchone()
-            if audit is None:
-                raise ValueError("audit entry not found")
-            await cur.execute("SELECT * FROM public.pipelines WHERE id=%s", (pipeline_id,))
-            pipe = await cur.fetchone()
-            quarantined = random.randint(20, 150) if audit[2] == "null_threshold_exceeded" else 0
-            rows = random.randint(850, 1200)
-            run_id = await _record_run(conn, pipe[1], "success", rows, quarantined)
-            await cur.execute("""
-                UPDATE public.audit_log SET status='approved', approved_by=%s,
-                outcome='Fix applied · pipeline healed and rerun', resolved_at=now() WHERE id=%s
-            """, (approved_by, uuid.UUID(audit_id)))
-            await _set_status(conn, pipeline_id, "healthy")
-        await conn.commit()
+    async with pool.acquire() as conn:
+        audit = await conn.fetchrow("SELECT * FROM public.audit_log WHERE id=$1", uuid.UUID(audit_id))
+        if audit is None:
+            raise ValueError("audit entry not found")
+        pipe = await conn.fetchrow("SELECT * FROM public.pipelines WHERE id=$1", pipeline_id)
+        quarantined = random.randint(20, 150) if audit["error_type"] == "null_threshold_exceeded" else 0
+        rows = random.randint(850, 1200)
+        run_id = await _record_run(conn, pipe["dag_id"], "success", rows, quarantined)
+        await conn.execute(
+            """UPDATE public.audit_log SET status='approved', approved_by=$2,
+               outcome='Fix applied · pipeline healed and rerun', resolved_at=now() WHERE id=$1""",
+            uuid.UUID(audit_id), approved_by)
+        await _set_status(conn, pipeline_id, "healthy")
     await manager.broadcast("fix_approved", {
         "pipeline_id": pipeline_id, "status": "healthy", "approved_by": approved_by,
         "rows_processed": rows, "rows_quarantined": quarantined, "run_id": run_id,
@@ -202,15 +191,15 @@ async def approve_fix(pipeline_id: str, audit_id: str, approved_by: str) -> dict
 
 async def reject_fix(pipeline_id: str, audit_id: str, rejected_by: str, reason: str = "") -> dict:
     pool = await get_pool()
-    async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            outcome = f"Rejected · escalated to on-call. {reason}".strip()
-            await cur.execute("""
-                UPDATE public.audit_log SET status='rejected', approved_by=%s,
-                outcome=%s, resolved_at=now() WHERE id=%s
-            """, (rejected_by, outcome, uuid.UUID(audit_id)))
-            await _set_status(conn, pipeline_id, "critical", next_run=False)
-        await conn.commit()
+    async with pool.acquire() as conn:
+        outcome = f"Rejected · escalated to on-call. {reason}".strip()
+        res = await conn.execute(
+            """UPDATE public.audit_log SET status='rejected', approved_by=$2,
+               outcome=$3, resolved_at=now() WHERE id=$1""",
+            uuid.UUID(audit_id), rejected_by, outcome)
+        if res.endswith("0"):
+            raise ValueError("audit entry not found")
+        await _set_status(conn, pipeline_id, "critical", next_run=False)
     await manager.broadcast("fix_rejected", {
         "pipeline_id": pipeline_id, "status": "critical", "rejected_by": rejected_by,
     })
