@@ -4,15 +4,17 @@ import { getAudit } from "@/lib/api";
 
 const PIPELINES = [
   { id: "", label: "All Pipelines" },
-  { id: "olist_ingest", label: "Ingest" },
-  { id: "olist_validate", label: "Validate" },
-  { id: "olist_transform", label: "Transform" },
+  { id: "trends_ingest", label: "Ingest" },
+  { id: "trends_validate", label: "Validate" },
+  { id: "trends_transform", label: "Transform" },
 ];
 const STATUSES = [
   { id: "", label: "All Statuses" },
+  { id: "auto_fixed", label: "Auto-fixed (AI)" },
   { id: "pending_approval", label: "Pending" },
   { id: "approved", label: "Approved" },
   { id: "rejected", label: "Rejected" },
+  { id: "manually_fixed", label: "Manually fixed" },
 ];
 
 export default function AuditLogPage({ lastEvent }) {

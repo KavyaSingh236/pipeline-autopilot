@@ -48,6 +48,13 @@ class RejectRequest(BaseModel):
     reason: str = ""
 
 
+class ManualFixRequest(BaseModel):
+    audit_id: str
+    fixed_by: str = "operator"
+    action: str | None = None
+    instruction: str | None = None
+
+
 class AlertToggle(BaseModel):
     enabled: bool
 
@@ -80,7 +87,7 @@ async def list_pipelines():
             pending = await conn.fetchval(
                 "SELECT count(*) FROM public.pipeline_runs WHERE dag_id=$1", p["dag_id"])
             needs = await conn.fetchval(
-                "SELECT count(*) FROM public.audit_log WHERE pipeline_id=$1 AND status='pending_approval'",
+                "SELECT count(*) FROM public.audit_log WHERE pipeline_id=$1 AND status IN ('pending_approval','rejected')",
                 p["id"])
             item = dict(p)
             item["last_run"] = _row(last)
@@ -111,7 +118,7 @@ async def get_failures(pipeline_id: str):
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT * FROM public.audit_log
-               WHERE pipeline_id=$1 AND status='pending_approval'
+               WHERE pipeline_id=$1 AND status IN ('pending_approval','rejected')
                ORDER BY created_at DESC""",
             pipeline_id)
         return [dict(r) for r in rows]
@@ -131,6 +138,14 @@ async def reject(pipeline_id: str, req: RejectRequest):
         return await orchestrator.reject_fix(pipeline_id, req.audit_id, req.rejected_by, req.reason)
     except ValueError as e:
         raise HTTPException(404, str(e))
+
+
+@api.post("/pipelines/{pipeline_id}/manual-fix")
+async def manual_fix(pipeline_id: str, req: ManualFixRequest):
+    try:
+        return await orchestrator.manual_fix(pipeline_id, req.audit_id, req.fixed_by, req.action, req.instruction)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @api.get("/audit")
@@ -163,9 +178,7 @@ async def get_lineage(pipeline_id: str):
     pool = await db.get_pool()
     async with pool.acquire() as conn:
         counts = {}
-        for tbl in ["bronze.raw_orders", "bronze.raw_customers", "bronze.raw_products",
-                    "silver.orders_clean", "silver.customers_clean",
-                    "gold.daily_revenue", "gold.customer_segments"]:
+        for tbl in ["bronze.raw_trends", "silver.trends_clean", "gold.trending_terms", "gold.region_leaders"]:
             try:
                 counts[tbl] = await conn.fetchval(f"SELECT count(*) FROM {tbl}")
             except Exception:
@@ -178,21 +191,19 @@ async def get_lineage(pipeline_id: str):
                 "x": x, "y": y, "health": health if layer != "source" else "healthy"}
 
     nodes = [
-        node("src_csv", "Olist CSVs", None, "source", 0, 120),
-        node("b_orders", "bronze.raw_orders", "bronze.raw_orders", "bronze", 260, 20),
-        node("b_customers", "bronze.raw_customers", "bronze.raw_customers", "bronze", 260, 120),
-        node("b_products", "bronze.raw_products", "bronze.raw_products", "bronze", 260, 220),
-        node("s_orders", "silver.orders_clean", "silver.orders_clean", "silver", 540, 40),
-        node("s_customers", "silver.customers_clean", "silver.customers_clean", "silver", 540, 180),
-        node("g_revenue", "gold.daily_revenue", "gold.daily_revenue", "gold", 820, 40),
-        node("g_segments", "gold.customer_segments", "gold.customer_segments", "gold", 820, 180),
+        node("src", "Google Trends (BigQuery)", None, "source", 0, 120),
+        node("b_trends", "bronze.raw_trends", "bronze.raw_trends", "bronze", 260, 120),
+        node("s_trends", "silver.trends_clean", "silver.trends_clean", "silver", 540, 120),
+        node("g_terms", "gold.trending_terms", "gold.trending_terms", "gold", 820, 40),
+        node("g_region", "gold.region_leaders", "gold.region_leaders", "gold", 820, 200),
     ]
-    edges = [
-        ["src_csv", "b_orders"], ["src_csv", "b_customers"], ["src_csv", "b_products"],
-        ["b_orders", "s_orders"], ["b_customers", "s_customers"],
-        ["s_orders", "g_revenue"], ["s_customers", "g_segments"], ["s_orders", "g_segments"],
-    ]
+    edges = [["src", "b_trends"], ["b_trends", "s_trends"], ["s_trends", "g_terms"], ["s_trends", "g_region"]]
     return {"nodes": nodes, "edges": [{"source": s, "target": t} for s, t in edges]}
+
+
+@api.post("/demo/trigger")
+async def demo_trigger(error_type: str = Query("row_count_anomaly")):
+    return await orchestrator.trigger_demo(error_type)
 
 
 @api.get("/alerts/status")

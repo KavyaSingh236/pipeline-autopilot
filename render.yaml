@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: pipeline-autopilot-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL        # Neon connection string
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: ALERT_EMAIL
+        sync: false
+      - key: APP_URL             # your Netlify URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.9

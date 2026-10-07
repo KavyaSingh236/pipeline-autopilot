@@ -2,11 +2,33 @@ import { useState } from "react";
 import { motion } from "framer-motion";
 import { toast } from "sonner";
 import { AlertTriangle, Check, X, Wrench, Zap, ShieldAlert } from "lucide-react";
-import { approveFix, rejectFix } from "@/lib/api";
+import { approveFix, rejectFix, manualFix } from "@/lib/api";
 import { fmtTime } from "@/components/status";
 
 export default function FailureDetail({ pipelineId, failure, onResolved }) {
   const [busy, setBusy] = useState(false);
+  const [choice, setChoice] = useState("");
+  const [instruction, setInstruction] = useState("");
+  const rejected = failure.status === "rejected";
+  let alternatives = [];
+  try { alternatives = JSON.parse(failure.alternatives || "[]"); } catch (e) {}
+
+  const handleManual = async () => {
+    setBusy(true);
+    try {
+      await manualFix(pipelineId, {
+        audit_id: failure.id, fixed_by: "operator",
+        action: instruction.trim() ? undefined : choice || undefined,
+        instruction: instruction.trim() || undefined,
+      });
+      toast.success("Manual fix applied · pipeline healed");
+      onResolved?.();
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Manual fix failed");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const handleApprove = async () => {
     setBusy(true);
@@ -25,7 +47,7 @@ export default function FailureDetail({ pipelineId, failure, onResolved }) {
     setBusy(true);
     try {
       await rejectFix(pipelineId, { audit_id: failure.id, rejected_by: "operator", reason: "Manual review" });
-      toast("Fix rejected · escalated to on-call", { icon: "⚠" });
+      toast("Fix rejected · choose a manual fix", { icon: "⚠" });
       onResolved?.();
     } catch (e) {
       toast.error("Rejection failed");
@@ -44,7 +66,7 @@ export default function FailureDetail({ pipelineId, failure, onResolved }) {
     >
       <div className="flex items-center gap-2 text-[#FF0055]">
         <AlertTriangle size={16} />
-        <span className="text-[10px] tracking-[0.2em] uppercase">Human Approval Required</span>
+        <span className="text-[10px] tracking-[0.2em] uppercase">{rejected ? "Rejected · Manual Fix Required" : "Human Approval Required"}</span>
       </div>
 
       <h3 className="font-display text-2xl mt-4 tracking-tight text-white">
@@ -82,6 +104,77 @@ export default function FailureDetail({ pipelineId, failure, onResolved }) {
         <p className="font-mono text-sm text-white mt-2 leading-relaxed">{failure.proposed_fix}</p>
       </div>
 
+      {(failure.root_cause || failure.explanation) && (
+        <div className="mt-4 border border-white/10 bg-[#111111] p-4">
+          <div className="text-white/40 text-[10px] tracking-[0.2em] uppercase">
+            AI Diagnosis{failure.model ? ` · ${failure.model}` : ""}
+          </div>
+          {failure.root_cause && <p className="font-mono text-sm text-white mt-2">{failure.root_cause}</p>}
+          {failure.explanation && <p className="font-mono text-xs text-white/60 mt-2">{failure.explanation}</p>}
+          {failure.error_log && (
+            <pre className="font-mono text-[11px] text-[#FF0055]/80 mt-3 whitespace-pre-wrap">{failure.error_log}</pre>
+          )}
+        </div>
+      )}
+
+      {failure.recommendation && (
+        <div className="mt-4 border border-[#00E5FF]/30 bg-[#00E5FF]/5 p-4">
+          <div className="flex items-center gap-3">
+            <span className="text-[#00E5FF] text-[10px] tracking-[0.2em] uppercase">AI Recommendation</span>
+            <span
+              className="font-mono text-[10px] tracking-[0.15em] uppercase px-2 py-0.5 border"
+              style={failure.recommendation === "approve"
+                ? { color: "#00FF66", borderColor: "#00FF66" }
+                : { color: "#FF0055", borderColor: "#FF0055" }}
+            >
+              {failure.recommendation}
+            </span>
+          </div>
+          {failure.downstream_impact && (
+            <p className="font-mono text-xs text-white/70 mt-3"><span className="text-white/40">Impact · </span>{failure.downstream_impact}</p>
+          )}
+          {failure.risk_if_approved && (
+            <p className="font-mono text-xs text-white/70 mt-2"><span className="text-[#00FF66]/70">If approved · </span>{failure.risk_if_approved}</p>
+          )}
+          {failure.risk_if_rejected && (
+            <p className="font-mono text-xs text-white/70 mt-2"><span className="text-[#FF0055]/70">If rejected · </span>{failure.risk_if_rejected}</p>
+          )}
+        </div>
+      )}
+
+      {rejected ? (
+        <div className="mt-6 border border-white/10 bg-[#111111] p-4" data-testid="manual-fix-panel">
+          <div className="text-white/40 text-[10px] tracking-[0.2em] uppercase">Choose a manual fix</div>
+          <div className="mt-3 space-y-2">
+            {alternatives.map((alt) => (
+              <label key={alt.action} className="flex items-start gap-3 cursor-pointer">
+                <input type="radio" name="manual-fix" className="mt-1" checked={choice === alt.action}
+                  onChange={() => { setChoice(alt.action); setInstruction(""); }} />
+                <span className="font-mono text-xs text-white/80">
+                  {alt.label}<span className="block text-white/40">{alt.why}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+          <div className="text-white/40 text-[10px] tracking-[0.2em] uppercase mt-4">…or tell the AI what to do</div>
+          <textarea
+            data-testid="manual-fix-instruction"
+            value={instruction}
+            onChange={(e) => { setInstruction(e.target.value); setChoice(""); }}
+            placeholder="e.g. skip this run and keep yesterday's data"
+            className="w-full mt-2 bg-[#0A0A0A] border border-white/10 text-white font-mono text-xs p-3 focus:outline-none focus:border-[#00E5FF]/50"
+            rows={2}
+          />
+          <button
+            data-testid="apply-manual-fix-button"
+            disabled={busy || (!choice && !instruction.trim())}
+            onClick={handleManual}
+            className="mt-3 inline-flex items-center gap-2 px-5 py-2.5 font-mono text-xs tracking-[0.15em] uppercase bg-[#00E5FF] text-black hover:bg-white transition-colors disabled:opacity-40"
+          >
+            <Wrench size={15} /> Apply Fix
+          </button>
+        </div>
+      ) : (
       <div className="mt-6 flex gap-3">
         <button
           data-testid="approve-fix-button"
@@ -100,6 +193,7 @@ export default function FailureDetail({ pipelineId, failure, onResolved }) {
           <X size={15} /> Reject
         </button>
       </div>
+      )}
     </motion.div>
   );
 }

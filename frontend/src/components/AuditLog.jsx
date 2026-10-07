@@ -2,14 +2,16 @@ import { fmtTime } from "@/components/status";
 
 const OUTCOME_COLOR = {
   approved: "#00FF66",
+  auto_fixed: "#00E5FF",
+  manually_fixed: "#B388FF",
   rejected: "#FF0055",
   pending_approval: "#FFCC00",
 };
 
 const PIPE_LABEL = {
-  olist_ingest: "Ingest",
-  olist_validate: "Validate",
-  olist_transform: "Transform",
+  trends_ingest: "Ingest",
+  trends_validate: "Validate",
+  trends_transform: "Transform",
 };
 
 export default function AuditLog({ rows }) {
@@ -46,6 +48,14 @@ export default function AuditLog({ rows }) {
               </td>
               <td className="px-4 py-3 border-b border-white/5 font-mono text-xs text-white/60 max-w-[280px]">
                 {r.proposed_fix}
+                {r.outcome && r.status === "manually_fixed" && (
+                  <div className="text-[10px] text-white/40 mt-1 whitespace-normal">{r.outcome}</div>
+                )}
+                {r.root_cause && (
+                  <div className="text-[10px] text-white/40 mt-1 whitespace-normal">
+                    AI root cause: {r.root_cause}{r.model ? ` · ${r.model}` : ""}
+                  </div>
+                )}
               </td>
               <td className="px-4 py-3 border-b border-white/5 font-mono text-xs text-white/70 whitespace-nowrap">
                 {r.approved_by || "—"}

@@ -1,8 +1,7 @@
-"""PostgreSQL access layer + schema bootstrap + synthetic Olist seed data."""
+"""PostgreSQL access layer + schema bootstrap."""
 from __future__ import annotations
 import os
-import random
-from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import asyncpg
 import structlog
@@ -18,46 +17,18 @@ CREATE SCHEMA IF NOT EXISTS bronze;
 CREATE SCHEMA IF NOT EXISTS silver;
 CREATE SCHEMA IF NOT EXISTS gold;
 
-CREATE TABLE IF NOT EXISTS bronze.raw_orders (
-    order_id TEXT PRIMARY KEY,
-    customer_id TEXT,
-    order_status TEXT,
-    purchase_timestamp TIMESTAMPTZ,
-    price NUMERIC
+CREATE TABLE IF NOT EXISTS bronze.raw_trends (
+    id TEXT PRIMARY KEY, refresh_date DATE, region TEXT, region_id TEXT, term TEXT, week DATE,
+    rank INT, score DOUBLE PRECISION, ingested_at TIMESTAMPTZ DEFAULT now()
 );
-CREATE TABLE IF NOT EXISTS bronze.raw_customers (
-    customer_id TEXT PRIMARY KEY,
-    customer_city TEXT,
-    customer_state TEXT,
-    zip_code TEXT
+CREATE TABLE IF NOT EXISTS silver.trends_clean (
+    id TEXT PRIMARY KEY, refresh_date DATE, region TEXT, term TEXT, week DATE, rank INT, score DOUBLE PRECISION
 );
-CREATE TABLE IF NOT EXISTS bronze.raw_products (
-    product_id TEXT PRIMARY KEY,
-    product_category TEXT,
-    price NUMERIC
+CREATE TABLE IF NOT EXISTS gold.trending_terms (
+    term TEXT PRIMARY KEY, regions INT, avg_rank NUMERIC, best_rank INT
 );
-CREATE TABLE IF NOT EXISTS silver.orders_clean (
-    order_id TEXT PRIMARY KEY,
-    customer_id TEXT,
-    order_status TEXT,
-    purchase_timestamp TIMESTAMPTZ,
-    price NUMERIC
-);
-CREATE TABLE IF NOT EXISTS silver.customers_clean (
-    customer_id TEXT PRIMARY KEY,
-    customer_city TEXT,
-    customer_state TEXT,
-    zip_code TEXT
-);
-CREATE TABLE IF NOT EXISTS gold.daily_revenue (
-    revenue_date DATE PRIMARY KEY,
-    total_revenue NUMERIC,
-    order_count INT
-);
-CREATE TABLE IF NOT EXISTS gold.customer_segments (
-    segment TEXT PRIMARY KEY,
-    customer_count INT,
-    avg_spend NUMERIC
+CREATE TABLE IF NOT EXISTS gold.region_leaders (
+    region TEXT PRIMARY KEY, top_term TEXT, score DOUBLE PRECISION
 );
 CREATE TABLE IF NOT EXISTS public.audit_log (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -72,6 +43,18 @@ CREATE TABLE IF NOT EXISTS public.audit_log (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     resolved_at TIMESTAMPTZ
 );
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS root_cause TEXT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS action TEXT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS explanation TEXT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS error_log TEXT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS model TEXT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS confidence REAL;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS rows_affected INT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS recommendation TEXT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS downstream_impact TEXT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS risk_if_approved TEXT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS risk_if_rejected TEXT;
+ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS alternatives TEXT;
 CREATE TABLE IF NOT EXISTS public.pipeline_runs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     dag_id TEXT NOT NULL,
@@ -95,38 +78,20 @@ CREATE TABLE IF NOT EXISTS public.pipelines (
 """
 
 PIPELINES = [
-    {
-        "id": "olist_ingest",
-        "dag_id": "ingest_dag",
-        "name": "Ingest · Olist CSVs",
-        "layer": "bronze",
-        "description": "Pulls Olist orders/customers/products CSVs into the bronze schema.",
-        "schedule": "@hourly",
-    },
-    {
-        "id": "olist_validate",
-        "dag_id": "validate_dag",
-        "name": "Validate · Great Expectations",
-        "layer": "bronze",
-        "description": "Runs data-quality checks (nulls, schema, value ranges) on bronze.",
-        "schedule": "@hourly",
-    },
-    {
-        "id": "olist_transform",
-        "dag_id": "transform_dag",
-        "name": "Transform · Bronze → Silver → Gold",
-        "layer": "gold",
-        "description": "Cleans and aggregates data into silver and gold marts.",
-        "schedule": "@daily",
-    },
+    {"id": "trends_ingest", "dag_id": "ingest_dag", "name": "Ingest · Google Trends (BigQuery)", "layer": "bronze",
+     "description": "Pulls Google Search top-25 trending terms per US region from the BigQuery public dataset into bronze.", "schedule": "@hourly"},
+    {"id": "trends_validate", "dag_id": "validate_dag", "name": "Validate · Data Quality Checks", "layer": "bronze",
+     "description": "Checks schema, types, nulls, duplicates, rank ranges and row counts on each batch.", "schedule": "@hourly"},
+    {"id": "trends_transform", "dag_id": "transform_dag", "name": "Transform · Bronze → Silver → Gold", "layer": "gold",
+     "description": "Cleans trends into silver; builds trending-terms and regional-leader gold marts.", "schedule": "@daily"},
 ]
 
-_STATES = ["SP", "RJ", "MG", "BA", "RS", "PR", "SC", "PE", "CE", "GO"]
-_CITIES = ["sao paulo", "rio de janeiro", "belo horizonte", "salvador", "porto alegre",
-           "curitiba", "florianopolis", "recife", "fortaleza", "goiania"]
-_CATEGORIES = ["cama_mesa_banho", "beleza_saude", "esporte_lazer", "moveis_decoracao",
-               "informatica_acessorios", "utilidades_domesticas", "relogios_presentes"]
-_STATUSES = ["delivered", "shipped", "canceled", "processing", "invoiced"]
+
+def _clean_url(url: str) -> str:
+    """asyncpg rejects some libpq params that Neon adds (channel_binding)."""
+    p = urlparse(url)
+    q = [(k, v) for k, v in parse_qsl(p.query) if k != "channel_binding"]
+    return urlunparse(p._replace(query=urlencode(q)))
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -136,7 +101,7 @@ async def get_pool() -> asyncpg.Pool:
 
 async def init_db() -> None:
     global _pool
-    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    _pool = await asyncpg.create_pool(_clean_url(DATABASE_URL), min_size=1, max_size=10)
     async with _pool.acquire() as conn:
         await conn.execute(SCHEMA_DDL)
         for p in PIPELINES:
@@ -146,53 +111,4 @@ async def init_db() -> None:
                    ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, description=EXCLUDED.description""",
                 p["id"], p["dag_id"], p["name"], p["layer"], p["description"], p["schedule"],
             )
-    await _seed_data()
     log.info("db_initialised")
-
-
-async def _seed_data() -> None:
-    assert _pool is not None
-    async with _pool.acquire() as conn:
-        count = await conn.fetchval("SELECT count(*) FROM bronze.raw_orders")
-        if count and count > 0:
-            return
-
-        customers, orders, products = [], [], []
-        for i in range(400):
-            cid = f"cust_{i:04d}"
-            customers.append((cid, random.choice(_CITIES), random.choice(_STATES),
-                              f"{random.randint(10000, 99999)}"))
-        for i in range(120):
-            pid = f"prod_{i:04d}"
-            products.append((pid, random.choice(_CATEGORIES), round(random.uniform(10, 900), 2)))
-        for i in range(1000):
-            oid = f"order_{i:05d}"
-            cid = f"cust_{random.randint(0, 399):04d}"
-            ts = datetime.now(timezone.utc) - timedelta(days=random.randint(0, 30),
-                                                         hours=random.randint(0, 23))
-            orders.append((oid, cid, random.choice(_STATUSES), ts, round(random.uniform(15, 1200), 2)))
-
-        await conn.executemany(
-            "INSERT INTO bronze.raw_customers VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING", customers)
-        await conn.executemany(
-            "INSERT INTO bronze.raw_products VALUES ($1,$2,$3) ON CONFLICT DO NOTHING", products)
-        await conn.executemany(
-            "INSERT INTO bronze.raw_orders VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING", orders)
-
-        await conn.execute("""
-            INSERT INTO silver.orders_clean
-            SELECT order_id, customer_id, order_status, purchase_timestamp, price
-            FROM bronze.raw_orders WHERE price > 0 ON CONFLICT DO NOTHING""")
-        await conn.execute("""
-            INSERT INTO silver.customers_clean
-            SELECT customer_id, customer_city, customer_state, zip_code
-            FROM bronze.raw_customers ON CONFLICT DO NOTHING""")
-        await conn.execute("""
-            INSERT INTO gold.daily_revenue (revenue_date, total_revenue, order_count)
-            SELECT date_trunc('day', purchase_timestamp)::date, sum(price), count(*)
-            FROM silver.orders_clean GROUP BY 1 ON CONFLICT (revenue_date) DO NOTHING""")
-        await conn.execute("""
-            INSERT INTO gold.customer_segments (segment, customer_count, avg_spend)
-            VALUES ('high_value', 42, 780.50), ('mid_value', 158, 320.10), ('low_value', 200, 95.75)
-            ON CONFLICT DO NOTHING""")
-        log.info("seed_complete", orders=len(orders), customers=len(customers))
