@@ -1,5 +1,6 @@
 """Pipeline Autopilot — FastAPI Control Tower API."""
 from __future__ import annotations
+import os
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -61,6 +62,12 @@ class AlertToggle(BaseModel):
 
 def _row(r) -> dict:
     return dict(r) if r is not None else None
+
+
+@api.get("/debug")
+async def debug():
+    return {"groq_key_set": bool(os.getenv("GROQ_API_KEY")), "google_creds_set": bool(os.getenv("GOOGLE_CREDENTIALS_JSON")),
+            "alerts_enabled": orchestrator.get_alerts_enabled(), **orchestrator.diagnostics()}
 
 
 @api.get("/")
