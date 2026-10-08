@@ -15,6 +15,7 @@ from starlette.middleware.cors import CORSMiddleware
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
+import agents
 import db
 import orchestrator
 from error_classifier import ERROR_PLAYBOOK
@@ -94,6 +95,8 @@ async def health():
 async def debug():
     return {
         "groq_key_set": bool(os.getenv("GROQ_API_KEY")),
+        "groq_model": os.getenv("GROQ_MODEL", "(not set - default llama-3.3-70b-versatile)"),
+        "groq": agents.GROQ_STATUS,
         "google_creds_set": bool(os.getenv("GOOGLE_CREDENTIALS_JSON")),
         "alerts_enabled": orchestrator.get_alerts_enabled(),
         **orchestrator.diagnostics(),
