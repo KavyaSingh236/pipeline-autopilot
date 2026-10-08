@@ -1,5 +1,9 @@
+from __future__ import annotations
+
 import asyncio
+import json
 import os
+import random
 from datetime import datetime, timezone
 from typing import Any
 
@@ -8,6 +12,7 @@ import structlog
 
 import agents
 import data_source as ds
+import db
 from db import PIPELINES, get_pool
 from error_classifier import CRITICAL_TYPES
 from ws_manager import manager
@@ -17,27 +22,11 @@ try:
 except Exception:
     mailer = None
 
-log = structlog.get_logger()
+log = structlog.get_logger(__name__)
 
-TICK_SECONDS = int(os.getenv("TICK_SECONDS", "30"))
-INITIAL_DELAY_SECONDS = int(os.getenv("INITIAL_DELAY_SECONDS", "5"))
-FAILURE_CHANCE = float(os.getenv("FAILURE_CHANCE", "0.6"))
-
-_client: httpx.AsyncClient | None = None
-_scheduler_task: asyncio.Task | None = None
-
-_last_good: list[dict[str, Any]] = []
-_baseline = 0
-
-_held: dict[str, list[dict[str, Any]]] = {}
-_last_error: str | None = None
-_ticks = 0
-_last_tick: str | None = None
-_rows_in_batch = 0
-_bigquery_ok: bool | None = None
-
-DEMO_PIPELINE = "trends-monitor"
-
+TICK_SECONDS = max(10, int(os.getenv("TICK_SECONDS", "30")))
+INITIAL_DELAY_SECONDS = max(0, int(os.getenv("INITIAL_DELAY_SECONDS", "5")))
+DEMO_PIPELINE = "trends_ingest"
 ROUTINE_TYPES = [
     "schema_mismatch",
     "null_threshold_exceeded",
@@ -45,17 +34,18 @@ ROUTINE_TYPES = [
     "duplicate_records",
     "invalid_range",
 ]
+ALLOWED_TYPES = ROUTINE_TYPES + ["row_count_anomaly"]
 
-FAILURE_CYCLE = [
-    "routine",
-    "routine",
-    "routine",
-    "routine",
-    "routine",
-    "routine",
-    "routine",
-    "critical",
-]
+_client: httpx.AsyncClient | None = None
+_task: asyncio.Task | None = None
+_last_error: str | None = None
+_last_tick: str | None = None
+_ticks = 0
+_rows_in_batch = 0
+_bigquery_ok: bool | None = None
+_alerts_enabled = True
+_held: dict[str, list[dict[str, Any]]] = {}
+_last_good: dict[str, list[dict[str, Any]]] = {}
 
 
 def _now() -> str:
@@ -72,1303 +62,431 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def _row_count(rows: Any) -> int:
+def _pipeline(pipeline_id: str) -> dict[str, Any]:
+    return next((p for p in PIPELINES if p.get("id") == pipeline_id),
+                {"id": pipeline_id, "dag_id": pipeline_id, "name": pipeline_id})
+
+
+async def _broadcast(event_type: str, payload: dict[str, Any]) -> None:
     try:
-        return len(rows)
-    except Exception:
-        return 0
-
-
-def _pipeline_name(pipeline_id: str) -> str:
-    for p in PIPELINES:
-        if p.get("id") == pipeline_id:
-            return p.get("name", pipeline_id)
-    return pipeline_id
-
-
-def _pipeline_config(pipeline_id: str) -> dict[str, Any]:
-    for p in PIPELINES:
-        if p.get("id") == pipeline_id:
-            return p
-    return {"id": pipeline_id, "name": pipeline_id}
-
-
-def _failure_class(number: int) -> str:
-    return "critical" if number == 8 else "routine"
-
-
-def _allowed_types() -> list[str]:
-    return list(ROUTINE_TYPES) + ["row_count_anomaly"]
-
-
-async def _get_failure_number(conn) -> int:
-    row = await conn.fetchrow(
-        """
-        SELECT failure_count
-        FROM public.orchestrator_state
-        WHERE id = 1
-        """
-    )
-
-    if not row:
-        await conn.execute(
-            """
-            INSERT INTO public.orchestrator_state(id, failure_count)
-            VALUES (1, 0)
-            ON CONFLICT (id) DO NOTHING
-            """
-        )
-        return 1
-
-    current = int(row["failure_count"])
-    return current + 1 if current < 8 else 1
-
-
-async def _advance_failure_number(conn) -> None:
-    await conn.execute(
-        """
-        UPDATE public.orchestrator_state
-        SET failure_count = CASE
-            WHEN failure_count >= 8 THEN 0
-            ELSE failure_count + 1
-        END
-        WHERE id = 1
-        """
-    )
-
-
-async def _ensure_state(conn) -> None:
-    await conn.execute(
-        """
-        INSERT INTO public.orchestrator_state(id, failure_count)
-        VALUES (1, 0)
-        ON CONFLICT (id) DO NOTHING
-        """
-    )
-
-
-async def _get_latest_good(conn, pipeline_id: str) -> list[dict[str, Any]]:
-    try:
-        rows = await conn.fetch(
-            """
-            SELECT row_data
-            FROM public.pipeline_good_batches
-            WHERE pipeline_id = $1
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            pipeline_id,
-        )
-        if rows:
-            data = rows[0]["row_data"]
-            if isinstance(data, list):
-                return data
-    except Exception:
-        pass
-
-    return []
-
-
-async def _commit_good(
-    conn,
-    rows: list[dict[str, Any]],
-    pipeline_id: str = DEMO_PIPELINE,
-) -> None:
-    global _last_good, _baseline
-
-    clean_rows = [_jsonable(dict(row)) for row in rows]
-
-    try:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS public.pipeline_good_batches (
-                pipeline_id TEXT PRIMARY KEY,
-                row_data JSONB NOT NULL,
-                row_count INTEGER NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            """
-        )
-
-        await conn.execute(
-            """
-            INSERT INTO public.pipeline_good_batches(
-                pipeline_id,
-                row_data,
-                row_count,
-                created_at
-            )
-            VALUES ($1, $2::jsonb, $3, NOW())
-            ON CONFLICT (pipeline_id)
-            DO UPDATE SET
-                row_data = EXCLUDED.row_data,
-                row_count = EXCLUDED.row_count,
-                created_at = NOW()
-            """,
-            pipeline_id,
-            __import__("json").dumps(clean_rows),
-            len(clean_rows),
-        )
-    except Exception as exc:
-        log.warning("good_batch_persist_failed", error=str(exc))
-
-    _last_good = clean_rows
-    _baseline = len(clean_rows)
-
-
-async def _load_last_good(
-    conn,
-    pipeline_id: str,
-) -> list[dict[str, Any]]:
-    rows = await _get_latest_good(conn, pipeline_id)
-
-    if rows:
-        return rows
-
-    if pipeline_id == DEMO_PIPELINE and _last_good:
-        return [dict(row) for row in _last_good]
-
-    return []
-
-
-async def _has_open_failure(conn, pipeline_id: str) -> bool:
-    try:
-        row = await conn.fetchrow(
-            """
-            SELECT 1
-            FROM public.audit_log
-            WHERE pipeline_id = $1
-              AND status IN ('pending_approval', 'open', 'detected')
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            pipeline_id,
-        )
-        return bool(row)
-    except Exception:
-        return False
-
-
-async def _create_audit(
-    conn,
-    *,
-    pipeline_id: str,
-    status: str,
-    error_type: str,
-    root_cause: str | None = None,
-    action: str | None = None,
-    explanation: str | None = None,
-    error_log: str | None = None,
-    model: str | None = None,
-    confidence: float | None = None,
-    rows_affected: int | None = None,
-    recommendation: str | None = None,
-    downstream_impact: str | None = None,
-    risk_if_approved: str | None = None,
-    risk_if_rejected: str | None = None,
-    alternatives: Any = None,
-) -> str:
-    alternatives_value = alternatives
-
-    if alternatives_value is not None and not isinstance(
-        alternatives_value,
-        str,
-    ):
-        import json
-
-        alternatives_value = json.dumps(
-            _jsonable(alternatives_value)
-        )
-
-    row = await conn.fetchrow(
-        """
-        INSERT INTO public.audit_log(
-            pipeline_id,
-            status,
-            error_type,
-            root_cause,
-            action,
-            explanation,
-            error_log,
-            model,
-            confidence,
-            rows_affected,
-            recommendation,
-            downstream_impact,
-            risk_if_approved,
-            risk_if_rejected,
-            alternatives,
-            created_at
-        )
-        VALUES(
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW()
-        )
-        RETURNING id
-        """,
-        pipeline_id,
-        status,
-        error_type,
-        root_cause,
-        action,
-        explanation,
-        error_log,
-        model,
-        confidence,
-        rows_affected,
-        recommendation,
-        downstream_impact,
-        risk_if_approved,
-        risk_if_rejected,
-        alternatives_value,
-    )
-
-    return str(row["id"])
-
-
-async def _update_audit(
-    conn,
-    audit_id: str,
-    *,
-    status: str | None = None,
-    action: str | None = None,
-    explanation: str | None = None,
-) -> None:
-    sets = []
-    values: list[Any] = []
-    index = 1
-
-    if status is not None:
-        sets.append(f"status = ${index}")
-        values.append(status)
-        index += 1
-
-    if action is not None:
-        sets.append(f"action = ${index}")
-        values.append(action)
-        index += 1
-
-    if explanation is not None:
-        sets.append(f"explanation = ${index}")
-        values.append(explanation)
-        index += 1
-
-    if not sets:
-        return
-
-    values.append(audit_id)
-
-    await conn.execute(
-        f"""
-        UPDATE public.audit_log
-        SET {", ".join(sets)}
-        WHERE id = ${index}
-        """,
-        *values,
-    )
-
-
-async def _broadcast(event: dict[str, Any]) -> None:
-    try:
-        await manager.broadcast(_jsonable(event))
+        await manager.broadcast(event_type, _jsonable(payload))
     except Exception as exc:
         log.warning("websocket_broadcast_failed", error=str(exc))
 
 
-async def _send_alert(
-    pipeline_id: str,
-    audit_id: str,
-    error_type: str,
-) -> None:
-    if mailer is None:
-        return
+async def _ensure_state(conn) -> None:
+    await conn.execute(
+        """INSERT INTO public.orchestrator_state(id, failure_count)
+           VALUES (1, 0) ON CONFLICT (id) DO NOTHING"""
+    )
 
+
+async def _next_failure_number(conn) -> int:
+    await _ensure_state(conn)
+    row = await conn.fetchrow(
+        "SELECT failure_count FROM public.orchestrator_state WHERE id=1 FOR UPDATE"
+    )
+    current = int(row["failure_count"]) if row else 0
+    number = 1 if current >= 8 else current + 1
+    await conn.execute(
+        "UPDATE public.orchestrator_state SET failure_count=$1 WHERE id=1",
+        0 if number == 8 else number,
+    )
+    return number
+
+
+async def _load_good(conn, pipeline_id: str) -> list[dict[str, Any]]:
+    if pipeline_id in _last_good and _last_good[pipeline_id]:
+        return [dict(r) for r in _last_good[pipeline_id]]
     try:
-        await mailer.send_critical_alert(
-            pipeline_id=pipeline_id,
-            audit_id=audit_id,
-            error_type=error_type,
+        rows = await conn.fetch(
+            """SELECT row_data FROM public.pipeline_good_batches
+               WHERE pipeline_id=$1 LIMIT 1""",
+            pipeline_id,
         )
-    except Exception as exc:
-        log.warning(
-            "critical_email_failed",
-            pipeline_id=pipeline_id,
-            error=str(exc),
-        )
+        if rows:
+            value = rows[0]["row_data"]
+            if isinstance(value, str):
+                value = json.loads(value)
+            if isinstance(value, list):
+                _last_good[pipeline_id] = [dict(r) for r in value]
+                return [dict(r) for r in value]
+    except Exception:
+        pass
+    return []
+
+
+async def _save_good(conn, pipeline_id: str, rows: list[dict[str, Any]]) -> None:
+    clean = _jsonable([dict(r) for r in rows])
+    await conn.execute(
+        """CREATE TABLE IF NOT EXISTS public.pipeline_good_batches (
+            pipeline_id TEXT PRIMARY KEY,
+            row_data JSONB NOT NULL,
+            row_count INTEGER NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"""
+    )
+    await conn.execute(
+        """INSERT INTO public.pipeline_good_batches
+           (pipeline_id,row_data,row_count,created_at)
+           VALUES ($1,$2::jsonb,$3,NOW())
+           ON CONFLICT (pipeline_id) DO UPDATE SET
+           row_data=EXCLUDED.row_data,row_count=EXCLUDED.row_count,created_at=NOW()""",
+        pipeline_id, json.dumps(clean), len(clean),
+    )
+    _last_good[pipeline_id] = [dict(r) for r in rows]
+
+
+async def _has_open_failure(conn, pipeline_id: str) -> bool:
+    row = await conn.fetchrow(
+        """SELECT 1 FROM public.audit_log
+           WHERE pipeline_id=$1 AND status IN ('pending_approval','rejected','detected')
+           LIMIT 1""",
+        pipeline_id,
+    )
+    return bool(row)
+
+
+async def _insert_audit(
+    conn,
+    pipeline_id: str,
+    error_type: str,
+    status: str,
+    findings: list[dict[str, Any]],
+    diagnosis: dict[str, Any],
+    error_log: str,
+    rows_affected: int,
+) -> str:
+    alternatives = diagnosis.get("alternatives", [])
+    row = await conn.fetchrow(
+        """INSERT INTO public.audit_log
+           (pipeline_id,error_type,description,proposed_fix,auto_fixable,status,
+            root_cause,action,explanation,error_log,model,confidence,rows_affected,
+            recommendation,downstream_impact,risk_if_approved,risk_if_rejected,
+            alternatives,created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW())
+           RETURNING id""",
+        pipeline_id,
+        error_type,
+        "; ".join(str(f.get("detail", "")) for f in findings)[:1000],
+        str(diagnosis.get("explanation", ""))[:1000],
+        error_type not in CRITICAL_TYPES,
+        status,
+        str(diagnosis.get("root_cause", ""))[:1000],
+        str(diagnosis.get("action", "")),
+        str(diagnosis.get("explanation", ""))[:1000],
+        error_log[:4000],
+        str(diagnosis.get("model", "rule-based-fallback")),
+        float(diagnosis.get("confidence", 0.7)),
+        rows_affected,
+        str(diagnosis.get("recommendation", "Review the incident")),
+        str(diagnosis.get("downstream_impact", ""))[:1000],
+        str(diagnosis.get("risk_if_approved", ""))[:1000],
+        str(diagnosis.get("risk_if_rejected", ""))[:1000],
+        json.dumps(_jsonable(alternatives)),
+    )
+    return str(row["id"])
+
+
+async def _update_audit(conn, audit_id: str, status: str, action: str, explanation: str) -> None:
+    await conn.execute(
+        """UPDATE public.audit_log SET status=$1,action=$2,explanation=$3,
+           outcome=$3,resolved_at=CASE WHEN $1 IN
+           ('approved','manually_fixed','auto_fixed') THEN NOW() ELSE resolved_at END
+           WHERE id=$4""",
+        status, action, explanation, audit_id,
+    )
 
 
 async def _get_batch() -> list[dict[str, Any]]:
     global _bigquery_ok
-
     try:
         rows = await asyncio.to_thread(ds.fetch_batch_sync)
         _bigquery_ok = True
-        return [dict(row) for row in rows]
-    except Exception as exc:
+        return [dict(r) for r in rows]
+    except Exception:
         _bigquery_ok = False
-        raise RuntimeError(
-            f"BigQuery fetch failed: {exc}"
-        ) from exc
+        raise
 
 
-async def _ask_agent_for_injection(
-    pipeline_id: str,
-    rows: list[dict[str, Any]],
-    allowed_class: str,
-) -> dict[str, Any]:
-    result = await agents.plan_injection(
-        _client,
-        pipeline_id,
-        allowed_class,
-        len(rows),
-    )
-
-    if not isinstance(result, dict):
-        result = {}
-
-    error_type = str(
-        result.get("error_type")
-        or ""
-    ).strip()
-
-    if allowed_class == "critical":
-        error_type = "row_count_anomaly"
-    elif error_type not in ROUTINE_TYPES:
-        error_type = ROUTINE_TYPES[
-            (len(rows) + len(pipeline_id)) % len(ROUTINE_TYPES)
-        ]
-
-    result["error_type"] = error_type
-    result["failure_class"] = allowed_class
-
-    return result
-
-
-async def _inject_failure(
-    rows: list[dict[str, Any]],
-    plan: dict[str, Any],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    error_type = plan["error_type"]
-
-    bad_rows, details = await ds.inject(
-        rows,
-        error_type,
-        plan,
-    )
-
-    if not isinstance(details, dict):
-        details = {"details": str(details)}
-
-    details["error_type"] = error_type
-
-    return (
-        [dict(row) for row in bad_rows],
-        details,
-    )
-
-
-async def _validate(
-    rows: list[dict[str, Any]],
-    expected_error: str | None = None,
-) -> dict[str, Any]:
-    result = await ds.validate(
-        rows,
-        expected_error,
-    )
-
-    if isinstance(result, dict):
-        return result
-
-    return {
-        "valid": bool(result),
-        "findings": [],
-    }
-
-
-async def _classify_with_agent(
-    *,
-    pipeline_id: str,
-    error_type: str,
-    validation: dict[str, Any],
-    injection: dict[str, Any],
-) -> dict[str, Any]:
-    context = {
-        "pipeline_id": pipeline_id,
-        "error_type": error_type,
-        "validation": _jsonable(validation),
-        "injection": _jsonable(injection),
-    }
-
-    try:
-        result = await agents.diagnose_failure(
-            _client,
-            context,
-        )
-    except Exception as exc:
-        result = {
-            "root_cause": f"Automated diagnosis fallback: {exc}",
-            "recommendation": (
-                "Use the whitelisted remediation for this failure type."
-            ),
-            "confidence": 0.75,
-        }
-
-    if not isinstance(result, dict):
-        result = {}
-
-    return result
-
-
-async def _apply_routine_fix(
-    conn,
-    *,
-    pipeline_id: str,
-    audit_id: str,
-    rows: list[dict[str, Any]],
-    error_type: str,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    action_map = getattr(
-        ds,
-        "ALLOWED_ACTION",
-        {},
-    )
-
-    action = action_map.get(error_type)
-
-    if not action:
-        raise ValueError(
-            f"No whitelisted automatic action for {error_type}"
-        )
-
-    fixed_rows = await ds.apply_fix(
-        rows,
-        error_type,
-        action,
-    )
-
-    if fixed_rows is None:
-        fixed_rows = rows
-
-    fixed_rows = [dict(row) for row in fixed_rows]
-
-    validation = await _validate(
-        fixed_rows,
-        None,
-    )
-
-    valid = bool(
-        validation.get("valid", False)
-    )
-
-    if not valid:
-        raise RuntimeError(
-            f"Automatic remediation failed validation for {error_type}"
-        )
-
-    await _update_audit(
-        conn,
-        audit_id,
-        status="auto_fixed",
-        action=action,
-        explanation=(
-            f"Routine failure {error_type} was automatically "
-            f"remediated using the whitelisted action {action}."
-        ),
-    )
-
-    await _commit_good(
-        conn,
-        fixed_rows,
-        pipeline_id,
-    )
-
-    return fixed_rows, validation
-
-
-async def process_pipeline(
-    pipeline_id: str,
-    *,
-    count_toward_cycle: bool = True,
-    forced_error_type: str | None = None,
-) -> dict[str, Any]:
-    global _rows_in_batch
-    global _last_error
-
+async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = None,
+                              count_cycle: bool = True) -> dict[str, Any]:
+    global _rows_in_batch, _last_error
+    pipeline = _pipeline(pipeline_id)
     pool = await get_pool()
-
     async with pool.acquire() as conn:
-        if await _has_open_failure(
-            conn,
-            pipeline_id,
-        ):
-            return {
-                "pipeline_id": pipeline_id,
-                "status": "pending_approval",
-                "message": "Pipeline has an unresolved failure.",
-            }
+        if await _has_open_failure(conn, pipeline_id):
+            return {"pipeline_id": pipeline_id, "status": "pending_approval",
+                    "message": "This pipeline has an unresolved incident."}
 
         rows = await _get_batch()
-
         _rows_in_batch = len(rows)
-
         if not rows:
-            raise RuntimeError(
-                "BigQuery returned no rows."
-            )
+            raise RuntimeError("BigQuery returned no rows.")
 
-        if pipeline_id == DEMO_PIPELINE and not _last_good:
-            await _commit_good(
-                conn,
-                rows,
-                pipeline_id,
-            )
-
-        if count_toward_cycle:
-            failure_number = await _get_failure_number(
-                conn
-            )
-            failure_class = _failure_class(
-                failure_number
-            )
-        else:
-            failure_number = 0
-            failure_class = (
-                "critical"
-                if forced_error_type in CRITICAL_TYPES
-                else "routine"
-            )
+        good = await _load_good(conn, pipeline_id)
+        if not good:
+            await ds.load(conn, rows)
+            await _save_good(conn, pipeline_id, rows)
+            good = rows
 
         if forced_error_type:
-            allowed_class = (
-                "critical"
-                if forced_error_type in CRITICAL_TYPES
-                else "routine"
-            )
+            error_type = forced_error_type
+            failure_number = 8 if error_type == "row_count_anomaly" else 1
+            severity = "critical" if error_type == "row_count_anomaly" else "routine"
         else:
-            allowed_class = failure_class
+            failure_number = await _next_failure_number(conn) if count_cycle else 1
+            severity = "critical" if failure_number == 8 else "routine"
+            error_type = None
 
-        plan = await _ask_agent_for_injection(
-            pipeline_id,
-            rows,
-            allowed_class,
+        plan = await agents.generate_failure(
+            _client, pipeline, len(rows), severity, failure_number
         )
-
         if forced_error_type:
             plan["error_type"] = forced_error_type
-
+        if severity == "critical":
+            plan["error_type"] = "row_count_anomaly"
         error_type = plan["error_type"]
-
-        if failure_class == "critical":
-            error_type = "row_count_anomaly"
-            plan["error_type"] = error_type
-
-        bad_rows, injection = await _inject_failure(
-            rows,
-            plan,
+        bad_rows = ds.inject(
+            error_type, rows, random.Random(), plan.get("fraction")
+        )
+        if error_type == "row_count_anomaly":
+            bad_rows = random.sample(rows, max(1, int(len(rows) * 0.4)))
+        findings = ds.validate(bad_rows, len(good))
+        if not findings:
+            findings = [{"type": error_type, "detail": f"Controlled {error_type} injected for incident testing."}]
+        error_log, log_model = await agents.write_error_log(
+            _client, pipeline, error_type, findings, len(bad_rows),
+            str(plan.get("scenario", "")),
+        )
+        diagnosis = await agents.remediation_agent(
+            _client, error_type, error_log, findings
+        )
+        diagnosis["model"] = diagnosis.get("model") or log_model
+        diagnosis["action"] = diagnosis.get("action") or ds.ALLOWED_ACTION[error_type]
+        critical = error_type in CRITICAL_TYPES
+        rows_affected = abs(len(rows) - len(bad_rows))
+        if not rows_affected:
+            rows_affected = sum(1 for f in findings if f.get("type") == error_type)
+        audit_id = await _insert_audit(
+            conn, pipeline_id, error_type,
+            "pending_approval" if critical else "detected",
+            findings, diagnosis, error_log, rows_affected,
         )
 
-        validation = await _validate(
-            bad_rows,
-            error_type,
-        )
+        if critical:
+            _held[audit_id] = [dict(r) for r in bad_rows]
+            await _broadcast("critical_failure", {
+                "pipeline_id": pipeline_id, "audit_id": audit_id,
+                "error_type": error_type, "status": "pending_approval",
+                "recommendation": diagnosis.get("recommendation"),
+                "downstream_impact": diagnosis.get("downstream_impact"),
+                "risk_if_approved": diagnosis.get("risk_if_approved"),
+                "risk_if_rejected": diagnosis.get("risk_if_rejected"),
+                "alternatives": diagnosis.get("alternatives", []),
+            })
+            if _alerts_enabled and mailer is not None:
+                try:
+                    await asyncio.to_thread(
+                        mailer.send_alert,
+                        pipeline["name"], pipeline_id, audit_id, error_type,
+                        "; ".join(str(f.get("detail", "")) for f in findings),
+                        diagnosis.get("root_cause", ""),
+                        diagnosis.get("action", ""),
+                        diagnosis.get("explanation", ""),
+                        diagnosis.get("downstream_impact", ""),
+                        diagnosis.get("risk_if_approved", ""),
+                        diagnosis.get("risk_if_rejected", ""),
+                    )
+                except Exception as exc:
+                    log.warning("critical_email_failed", error=str(exc))
+            return {"pipeline_id": pipeline_id, "audit_id": audit_id,
+                    "status": "pending_approval", "error_type": error_type}
 
-        diagnosis = await _classify_with_agent(
-            pipeline_id=pipeline_id,
-            error_type=error_type,
-            validation=validation,
-            injection=injection,
-        )
-
-        root_cause = str(
-            diagnosis.get(
-                "root_cause",
-                f"Detected {error_type}.",
-            )
-        )
-
-        recommendation = str(
-            diagnosis.get(
-                "recommendation",
-                "Review the detected failure.",
-            )
-        )
-
-        explanation = str(
-            diagnosis.get(
-                "explanation",
-                recommendation,
-            )
-        )
-
-        confidence = diagnosis.get(
-            "confidence",
-            0.85,
-        )
-
-        try:
-            confidence = float(confidence)
-        except Exception:
-            confidence = 0.85
-
-        rows_affected = int(
-            validation.get(
-                "rows_affected",
-                abs(len(bad_rows) - len(rows)),
-            )
-            or 0
-        )
-
-        downstream_impact = str(
-            diagnosis.get(
-                "downstream_impact",
-                (
-                    "Potential downstream impact requires "
-                    "engineer review."
-                    if error_type in CRITICAL_TYPES
-                    else "Low-risk impact limited to this batch."
-                ),
-            )
-        )
-
-        risk_if_approved = str(
-            diagnosis.get(
-                "risk_if_approved",
-                (
-                    "Potential propagation of incorrect row counts "
-                    "to downstream consumers."
-                    if error_type in CRITICAL_TYPES
-                    else "Low risk when validation succeeds."
-                ),
-            )
-        )
-
-        risk_if_rejected = str(
-            diagnosis.get(
-                "risk_if_rejected",
-                (
-                    "Pipeline remains on the previous known-good "
-                    "batch until manually resolved."
-                ),
-            )
-        )
-
-        alternatives = diagnosis.get(
-            "alternatives",
-            [
-                {
-                    "action": "reload_last_good_batch",
-                    "label": "Reload last known-good batch",
-                },
-                {
-                    "action": "accept_partial_batch",
-                    "label": "Accept partial batch as-is",
-                },
-                {
-                    "action": "skip_and_keep_previous",
-                    "label": "Skip run and keep previous batch",
-                },
-            ],
-        )
-
-        status = (
-            "pending_approval"
-            if error_type in CRITICAL_TYPES
-            else "detected"
-        )
-
-        audit_id = await _create_audit(
-            conn,
-            pipeline_id=pipeline_id,
-            status=status,
-            error_type=error_type,
-            root_cause=root_cause,
-            action=(
-                "pending_human_approval"
-                if error_type in CRITICAL_TYPES
-                else getattr(
-                    ds,
-                    "ALLOWED_ACTION",
-                    {},
-                ).get(error_type)
-            ),
-            explanation=explanation,
-            error_log=str(
-                injection
-            ),
-            model=str(
-                diagnosis.get(
-                    "model",
-                    "Groq",
-                )
-            ),
-            confidence=confidence,
-            rows_affected=rows_affected,
-            recommendation=recommendation,
-            downstream_impact=downstream_impact,
-            risk_if_approved=risk_if_approved,
-            risk_if_rejected=risk_if_rejected,
-            alternatives=alternatives,
-        )
-
-        if count_toward_cycle:
-            await _advance_failure_number(conn)
-
-        if error_type in CRITICAL_TYPES:
-            _held[audit_id] = bad_rows
-
-            await _broadcast(
-                {
-                    "type": "critical_failure",
-                    "pipeline_id": pipeline_id,
-                    "audit_id": audit_id,
-                    "error_type": error_type,
-                    "status": "pending_approval",
-                    "recommendation": recommendation,
-                    "downstream_impact": downstream_impact,
-                    "risk_if_approved": risk_if_approved,
-                    "risk_if_rejected": risk_if_rejected,
-                    "alternatives": alternatives,
-                }
-            )
-
-            await _send_alert(
-                pipeline_id,
-                audit_id,
-                error_type,
-            )
-
-            return {
-                "pipeline_id": pipeline_id,
-                "audit_id": audit_id,
-                "status": "pending_approval",
-                "error_type": error_type,
-                "recommendation": recommendation,
-                "downstream_impact": downstream_impact,
-                "risk_if_approved": risk_if_approved,
-                "risk_if_rejected": risk_if_rejected,
-                "alternatives": alternatives,
-            }
-
-        fixed_rows, fixed_validation = await _apply_routine_fix(
-            conn,
-            pipeline_id=pipeline_id,
-            audit_id=audit_id,
-            rows=bad_rows,
-            error_type=error_type,
-        )
-
-        await _broadcast(
-            {
-                "type": "auto_fixed",
-                "pipeline_id": pipeline_id,
-                "audit_id": audit_id,
-                "error_type": error_type,
-                "status": "auto_fixed",
-                "action": getattr(
-                    ds,
-                    "ALLOWED_ACTION",
-                    {},
-                ).get(error_type),
-                "rows_affected": rows_affected,
-            }
-        )
-
-        return {
-            "pipeline_id": pipeline_id,
-            "audit_id": audit_id,
-            "status": "auto_fixed",
-            "error_type": error_type,
-            "rows": len(fixed_rows),
-            "validation": fixed_validation,
-        }
-
-
-async def approve_failure(
-    pipeline_id: str,
-    audit_id: str,
-    approved_by: str,
-) -> dict[str, Any]:
-    pool = await get_pool()
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT *
-            FROM public.audit_log
-            WHERE id = $1
-              AND pipeline_id = $2
-            """,
-            audit_id,
-            pipeline_id,
-        )
-
-        if not row:
-            raise ValueError(
-                "Audit record not found."
-            )
-
-        if row["status"] != "pending_approval":
-            raise ValueError(
-                "This failure is no longer awaiting approval."
-            )
-
-        good_rows = await _load_last_good(
-            conn,
-            pipeline_id,
-        )
-
-        if not good_rows:
-            raise RuntimeError(
-                "No known-good batch is available for recovery."
-            )
-
-        await ds.load(
-            conn,
-            good_rows,
-        )
-
-        await _commit_good(
-            conn,
-            good_rows,
-            pipeline_id,
-        )
-
+        action = ds.ALLOWED_ACTION[error_type]
+        fixed, quarantined = ds.apply_fix(action, bad_rows, good)
+        if not fixed:
+            fixed = good
+        remaining = ds.validate(fixed, len(good))
+        if remaining:
+            log.warning("auto_fix_validation_findings", pipeline_id=pipeline_id,
+                        findings=remaining)
+        await ds.load(conn, fixed)
+        await _save_good(conn, pipeline_id, fixed)
         await _update_audit(
-            conn,
-            audit_id,
-            status="approved",
-            action="reload_last_good_batch",
-            explanation=(
-                f"Critical failure approved by {approved_by}. "
-                "The pipeline was restored to its last known-good batch."
-            ),
+            conn, audit_id, "auto_fixed", action,
+            f"Automatically applied whitelisted action '{action}'. Quarantined {quarantined} rows.",
         )
-
-        _held.pop(audit_id, None)
-
-        await _broadcast(
-            {
-                "type": "critical_resolved",
-                "pipeline_id": pipeline_id,
-                "audit_id": audit_id,
-                "status": "approved",
-                "approved_by": approved_by,
-            }
-        )
-
-        return {
-            "pipeline_id": pipeline_id,
-            "audit_id": audit_id,
-            "status": "approved",
-            "action": "reload_last_good_batch",
-        }
+        await _broadcast("auto_fixed", {
+            "pipeline_id": pipeline_id, "audit_id": audit_id,
+            "error_type": error_type, "status": "auto_fixed",
+            "action": action, "rows_affected": rows_affected,
+        })
+        return {"pipeline_id": pipeline_id, "audit_id": audit_id,
+                "status": "auto_fixed", "error_type": error_type,
+                "rows_processed": len(fixed), "rows_quarantined": quarantined}
 
 
-async def reject_failure(
-    pipeline_id: str,
-    audit_id: str,
-    rejected_by: str,
-) -> dict[str, Any]:
-    pool = await get_pool()
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT *
-            FROM public.audit_log
-            WHERE id = $1
-              AND pipeline_id = $2
-            """,
-            audit_id,
-            pipeline_id,
-        )
-
-        if not row:
-            raise ValueError(
-                "Audit record not found."
-            )
-
-        if row["status"] != "pending_approval":
-            raise ValueError(
-                "This failure is no longer awaiting approval."
-            )
-
-        await _update_audit(
-            conn,
-            audit_id,
-            status="rejected",
-            action="manual_fix_required",
-            explanation=(
-                f"Critical recommendation rejected by {rejected_by}. "
-                "Manual remediation is required."
-            ),
-        )
-
-        await _broadcast(
-            {
-                "type": "critical_rejected",
-                "pipeline_id": pipeline_id,
-                "audit_id": audit_id,
-                "status": "rejected",
-                "rejected_by": rejected_by,
-            }
-        )
-
-        return {
-            "pipeline_id": pipeline_id,
-            "audit_id": audit_id,
-            "status": "rejected",
-            "manual_fix_required": True,
-        }
-
-
-async def manual_fix(
-    pipeline_id: str,
-    audit_id: str,
-    fixed_by: str,
-    action: str | None,
-    instruction: str | None,
-) -> dict[str, Any]:
-    global _last_good, _baseline
-
-    if not action and instruction:
-        action = await agents.interpret_instruction(
-            _client,
-            instruction,
-        )
-
-    manual_actions = getattr(
-        ds,
-        "MANUAL_ACTIONS",
-        {},
-    )
-
-    if action not in manual_actions:
-        raise ValueError(
-            "Invalid manual action."
-        )
-
-    pool = await get_pool()
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT *
-            FROM public.audit_log
-            WHERE id = $1
-              AND pipeline_id = $2
-            """,
-            audit_id,
-            pipeline_id,
-        )
-
-        if not row:
-            raise ValueError(
-                "Audit record not found."
-            )
-
-        if row["status"] not in (
-            "pending_approval",
-            "rejected",
-        ):
-            raise ValueError(
-                "This failure is not available for manual remediation."
-            )
-
-        if action == "reload_last_good_batch":
-            rows = await _load_last_good(
-                conn,
-                pipeline_id,
-            )
-
-            if not rows:
-                raise RuntimeError(
-                    "No known-good batch is available."
-                )
-
-            await ds.load(
-                conn,
-                rows,
-            )
-
-            _last_good = [
-                dict(item)
-                for item in rows
-            ]
-            _baseline = len(rows)
-
-            await _commit_good(
-                conn,
-                rows,
-                pipeline_id,
-            )
-
-        elif action == "accept_partial_batch":
-            rows = _held.get(
-                audit_id,
-                [],
-            )
-
-            if not rows:
-                raise RuntimeError(
-                    "The affected batch is no longer available "
-                    "in memory. Reload the last known-good batch instead."
-                )
-
-            await ds.load(
-                conn,
-                rows,
-            )
-
-            _last_good = [
-                dict(item)
-                for item in rows
-            ]
-            _baseline = len(rows)
-
-        elif action == "skip_and_keep_previous":
-            rows = await _load_last_good(
-                conn,
-                pipeline_id,
-            )
-
-            if not rows:
-                raise RuntimeError(
-                    "No known-good batch is available."
-                )
-
-            await ds.load(
-                conn,
-                rows,
-            )
-
-            _last_good = [
-                dict(item)
-                for item in rows
-            ]
-            _baseline = len(rows)
-
-        await _update_audit(
-            conn,
-            audit_id,
-            status="manually_fixed",
-            action=action,
-            explanation=(
-                f"Manual remediation completed by {fixed_by} "
-                f"using {manual_actions[action]}."
-            ),
-        )
-
-        _held.pop(
-            audit_id,
-            None,
-        )
-
-        await _broadcast(
-            {
-                "type": "manual_fix_completed",
-                "pipeline_id": pipeline_id,
-                "audit_id": audit_id,
-                "status": "manually_fixed",
-                "action": action,
-                "fixed_by": fixed_by,
-            }
-        )
-
-        return {
-            "pipeline_id": pipeline_id,
-            "audit_id": audit_id,
-            "status": "manually_fixed",
-            "action": action,
-        }
-
-
-async def run_pipeline_once(
-    pipeline_id: str,
-) -> dict[str, Any]:
-    try:
-        return await process_pipeline(
-            pipeline_id,
-            count_toward_cycle=True,
-        )
-    except Exception as exc:
-        global _last_error
-        _last_error = str(exc)
-
-        log.exception(
-            "pipeline_run_failed",
-            pipeline_id=pipeline_id,
-            error=str(exc),
-        )
-
-        return {
-            "pipeline_id": pipeline_id,
-            "status": "error",
-            "error": str(exc),
-        }
-
-
-async def scheduler_tick() -> dict[str, Any]:
-    global _ticks
-    global _last_tick
+async def run_pipeline_once(pipeline_id: str) -> dict[str, Any]:
     global _last_error
-
-    _ticks += 1
-    _last_tick = _now()
-
-    results = []
-
-    for pipeline in PIPELINES:
-        pipeline_id = pipeline.get(
-            "id",
-        )
-
-        if not pipeline_id:
-            continue
-
-        try:
-            result = await run_pipeline_once(
-                pipeline_id,
-            )
-            results.append(result)
-        except Exception as exc:
-            _last_error = str(exc)
-
-            results.append(
-                {
-                    "pipeline_id": pipeline_id,
-                    "status": "error",
-                    "error": str(exc),
-                }
-            )
-
-    return {
-        "tick": _ticks,
-        "timestamp": _last_tick,
-        "results": results,
-    }
+    try:
+        result = await _inject_and_process(pipeline_id)
+        _last_error = None
+        return result
+    except Exception as exc:
+        _last_error = str(exc)
+        log.exception("pipeline_run_failed", pipeline_id=pipeline_id, error=str(exc))
+        return {"pipeline_id": pipeline_id, "status": "error", "error": str(exc)}
 
 
 async def scheduler_loop() -> None:
-    await asyncio.sleep(
-        INITIAL_DELAY_SECONDS
-    )
-
+    global _ticks, _last_tick
+    await asyncio.sleep(INITIAL_DELAY_SECONDS)
     while True:
         try:
-            await scheduler_tick()
+            _ticks += 1
+            _last_tick = _now()
+            for pipeline in PIPELINES:
+                await run_pipeline_once(pipeline["id"])
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            log.exception("scheduler_tick_failed", error=str(exc))
             global _last_error
             _last_error = str(exc)
-
-            log.exception(
-                "scheduler_tick_failed",
-                error=str(exc),
-            )
-
-        await asyncio.sleep(
-            TICK_SECONDS
-        )
+        await asyncio.sleep(TICK_SECONDS)
 
 
-async def start_scheduler() -> None:
-    global _scheduler_task
-    global _client
-
+def start() -> None:
+    global _client, _task
     if _client is None:
-        _client = httpx.AsyncClient(
-            timeout=60.0
-        )
-
-    if _scheduler_task is None or _scheduler_task.done():
-        _scheduler_task = asyncio.create_task(
-            scheduler_loop()
-        )
+        _client = httpx.AsyncClient(timeout=60.0)
+    if _task is None or _task.done():
+        _task = asyncio.create_task(scheduler_loop())
 
 
-async def stop_scheduler() -> None:
-    global _scheduler_task
-    global _client
-
-    if _scheduler_task:
-        _scheduler_task.cancel()
-
+async def stop() -> None:
+    global _client, _task
+    if _task is not None:
+        _task.cancel()
         try:
-            await _scheduler_task
+            await _task
         except asyncio.CancelledError:
             pass
-
-        _scheduler_task = None
-
-    if _client:
+        _task = None
+    if _client is not None:
         await _client.aclose()
         _client = None
 
 
-async def force_failure(
-    pipeline_id: str,
-    error_type: str,
-) -> dict[str, Any]:
-    if error_type not in _allowed_types():
-        raise ValueError(
-            f"Unsupported error type: {error_type}"
-        )
-
-    return await process_pipeline(
-        pipeline_id,
-        count_toward_cycle=False,
-        forced_error_type=error_type,
-    )
-
-
-async def get_debug() -> dict[str, Any]:
+def diagnostics() -> dict[str, Any]:
     return {
-        "groq_key_set": bool(
-            os.getenv("GROQ_API_KEY")
-        ),
-        "google_creds_set": bool(
-            os.getenv("GOOGLE_CREDENTIALS_JSON")
-        ),
-        "alerts_enabled": bool(
-            os.getenv("RESEND_API_KEY")
-            and os.getenv("ALERT_EMAIL")
-        ),
         "ticks": _ticks,
         "last_tick": _last_tick,
-        "bigquery_ok": _bigquery_ok,
         "last_error": _last_error,
+        "bigquery_ok": _bigquery_ok,
         "rows_in_batch": _rows_in_batch,
-        "baseline_rows": _baseline,
         "held_critical_events": len(_held),
-        "failure_cycle": "1-7 routine, 8 critical",
+        "failure_cycle": "7 routine, 1 critical per 8 runs",
     }
 
 
-async def initialize() -> None:
+def get_alerts_enabled() -> bool:
+    return _alerts_enabled
+
+
+def set_alerts_enabled(value: bool) -> None:
+    global _alerts_enabled
+    _alerts_enabled = bool(value)
+
+
+async def approve_fix(pipeline_id: str, audit_id: str, approved_by: str) -> dict[str, Any]:
     pool = await get_pool()
-
     async with pool.acquire() as conn:
-        await _ensure_state(
-            conn
+        row = await conn.fetchrow(
+            "SELECT * FROM public.audit_log WHERE id=$1 AND pipeline_id=$2",
+            audit_id, pipeline_id,
         )
+        if not row:
+            raise ValueError("Audit record not found.")
+        if row["status"] != "pending_approval":
+            raise ValueError("This incident is no longer awaiting approval.")
+        good = await _load_good(conn, pipeline_id)
+        if not good:
+            raise RuntimeError("No last known-good batch is available.")
+        await ds.load(conn, good)
+        await _save_good(conn, pipeline_id, good)
+        await _update_audit(conn, audit_id, "approved", "reload_last_good_batch",
+                            f"Approved by {approved_by}; restored the last known-good batch.")
+    _held.pop(audit_id, None)
+    await _broadcast("critical_resolved", {"pipeline_id": pipeline_id,
+                    "audit_id": audit_id, "status": "approved", "approved_by": approved_by})
+    return {"pipeline_id": pipeline_id, "audit_id": audit_id,
+            "status": "approved", "action": "reload_last_good_batch"}
 
-        try:
-            existing = await _load_last_good(
-                conn,
-                DEMO_PIPELINE,
-            )
 
-            if existing:
-                global _last_good, _baseline
-                _last_good = existing
-                _baseline = len(existing)
-        except Exception as exc:
-            log.warning(
-                "initial_good_batch_load_failed",
-                error=str(exc),
-            )
+async def reject_fix(pipeline_id: str, audit_id: str, rejected_by: str,
+                     reason: str = "") -> dict[str, Any]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM public.audit_log WHERE id=$1 AND pipeline_id=$2",
+            audit_id, pipeline_id,
+        )
+        if not row:
+            raise ValueError("Audit record not found.")
+        if row["status"] != "pending_approval":
+            raise ValueError("This incident is no longer awaiting approval.")
+        await _update_audit(
+            conn, audit_id, "rejected", "manual_fix_required",
+            f"Recommendation rejected by {rejected_by}. {reason}".strip(),
+        )
+    await _broadcast("critical_rejected", {"pipeline_id": pipeline_id,
+                    "audit_id": audit_id, "status": "rejected", "rejected_by": rejected_by})
+    return {"pipeline_id": pipeline_id, "audit_id": audit_id,
+            "status": "rejected", "manual_fix_required": True}
 
 
-async def shutdown() -> None:
-    await stop_scheduler()
+async def manual_fix(pipeline_id: str, audit_id: str, fixed_by: str,
+                     action: str | None, instruction: str | None) -> dict[str, Any]:
+    if not action and instruction:
+        action = await agents.interpret_instruction(_client, instruction)
+    if action not in ds.MANUAL_ACTIONS:
+        raise ValueError("Instruction could not be mapped to an allowed manual action.")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM public.audit_log WHERE id=$1 AND pipeline_id=$2",
+            audit_id, pipeline_id,
+        )
+        if not row:
+            raise ValueError("Audit record not found.")
+        if row["status"] not in ("pending_approval", "rejected"):
+            raise ValueError("This incident is not available for manual remediation.")
+        if action in ("reload_last_good_batch", "skip_and_keep_previous"):
+            rows = await _load_good(conn, pipeline_id)
+            if not rows:
+                raise RuntimeError("No last known-good batch is available.")
+            await ds.load(conn, rows)
+            await _save_good(conn, pipeline_id, rows)
+        elif action == "accept_partial_batch":
+            rows = _held.get(audit_id, [])
+            if not rows:
+                raise RuntimeError("The affected batch is unavailable; choose reload last known-good batch.")
+            await ds.load(conn, rows)
+            await _save_good(conn, pipeline_id, rows)
+        await _update_audit(conn, audit_id, "manually_fixed", action,
+                            f"Manual remediation completed by {fixed_by} using {ds.MANUAL_ACTIONS[action]}.")
+    _held.pop(audit_id, None)
+    await _broadcast("manual_fix_completed", {"pipeline_id": pipeline_id,
+                    "audit_id": audit_id, "status": "manually_fixed",
+                    "action": action, "fixed_by": fixed_by})
+    return {"pipeline_id": pipeline_id, "audit_id": audit_id,
+            "status": "manually_fixed", "action": action}
+
+
+async def trigger_demo(error_type: str = "row_count_anomaly") -> dict[str, Any]:
+    if error_type not in ALLOWED_TYPES:
+        raise ValueError(f"Unsupported error type: {error_type}")
+    return await _inject_and_process(DEMO_PIPELINE, forced_error_type=error_type,
+                                     count_cycle=False)
