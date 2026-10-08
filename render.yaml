@@ -6,8 +6,9 @@ services:
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
     envVars:
-      - key: DATABASE_URL        # Neon connection string
+      - key: DATABASE_URL
         sync: false
       - key: GROQ_API_KEY
         sync: false
@@ -17,7 +18,13 @@ services:
         sync: false
       - key: ALERT_EMAIL
         sync: false
-      - key: APP_URL             # your Netlify URL
+      - key: APP_URL
         sync: false
+      - key: TICK_SECONDS
+        value: "30"
+      - key: INITIAL_DELAY_SECONDS
+        value: "5"
+      - key: FAILURE_CHANCE
+        value: "0.6"
       - key: PYTHON_VERSION
         value: 3.11.9
