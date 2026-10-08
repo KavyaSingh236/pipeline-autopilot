@@ -33,6 +33,11 @@ _baseline = 0
 _cache: tuple[list[dict], float] = ([], 0.0)
 _held: dict[str, list[dict]] = {}   # corrupted batches awaiting a human decision
 _rng = random.Random()
+_diag = {"ticks": 0, "last_tick": None, "bigquery_ok": None, "last_error": None, "rows_in_batch": 0}
+
+
+def diagnostics() -> dict:
+    return _diag
 
 
 def get_alerts_enabled() -> bool:
@@ -62,9 +67,12 @@ async def _clean_batch() -> list[dict]:
         rows = await asyncio.to_thread(ds.fetch_batch_sync)
         if rows:
             _cache = (rows, time.time())
+            _diag.update(bigquery_ok=True, last_error=None, rows_in_batch=len(rows))
             return rows
+        _diag.update(bigquery_ok=False, last_error="BigQuery returned 0 rows")
     except Exception as e:
-        log.warning("usgs_fetch_failed", error=str(e))
+        _diag.update(bigquery_ok=False, last_error=f"{type(e).__name__}: {str(e)[:300]}")
+        log.error("bigquery_fetch_failed", error=str(e))
     return _last_good or _cache[0]
 
 
@@ -254,11 +262,14 @@ async def _loop() -> None:
     while True:
         try:
             await asyncio.sleep(TICK_SECONDS)
+            _diag["ticks"] += 1
+            _diag["last_tick"] = datetime.now(timezone.utc).isoformat()
             await run_once(PIPELINES[idx % len(PIPELINES)])
             idx += 1
         except asyncio.CancelledError:
             break
         except Exception as exc:
+            _diag["last_error"] = f"tick: {type(exc).__name__}: {str(exc)[:300]}"
             log.error("orchestrator_tick_error", error=str(exc))
 
 
