@@ -11,6 +11,7 @@ from error_classifier import ERROR_PLAYBOOK
 log = structlog.get_logger(__name__)
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_STATUS = {"last_ok": None, "last_error": None, "calls": 0}
 
 ROUTINE_ERROR_TYPES = [
     "schema_mismatch",
@@ -56,8 +57,16 @@ async def _chat(client, system: str, user: str) -> dict | None:
             },
         )
         response.raise_for_status()
-        return json.loads(response.json()["choices"][0]["message"]["content"])
+        out = json.loads(response.json()["choices"][0]["message"]["content"])
+        GROQ_STATUS.update(last_ok=True, last_error=None, calls=GROQ_STATUS["calls"] + 1)
+        return out
     except Exception as exc:
+        body = ""
+        try:
+            body = response.text[:200]
+        except Exception:
+            pass
+        GROQ_STATUS.update(last_ok=False, last_error=f"{type(exc).__name__}: {str(exc)[:150]} {body}")
         log.warning("groq_call_failed", error=str(exc))
         return None
 
