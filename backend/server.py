@@ -1,16 +1,16 @@
-"""Pipeline Autopilot — FastAPI Control Tower API."""
 from __future__ import annotations
-import os
+
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 
 import structlog
-from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Query
+from dotenv import load_dotenv
+from fastapi import APIRouter, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
-from pathlib import Path
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -20,8 +20,15 @@ import orchestrator
 from error_classifier import ERROR_PLAYBOOK
 from ws_manager import manager
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.INFO))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
+structlog.configure(
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO)
+)
+
 log = structlog.get_logger("pipeline_autopilot")
 
 
@@ -30,11 +37,17 @@ async def lifespan(app: FastAPI):
     await db.init_db()
     orchestrator.start()
     log.info("api_started")
+
     yield
+
     await orchestrator.stop()
 
 
-app = FastAPI(title="Pipeline Autopilot API", lifespan=lifespan)
+app = FastAPI(
+    title="Pipeline Autopilot API",
+    lifespan=lifespan,
+)
+
 api = APIRouter(prefix="/api")
 
 
@@ -60,19 +73,39 @@ class AlertToggle(BaseModel):
     enabled: bool
 
 
-def _row(r) -> dict:
-    return dict(r) if r is not None else None
+def _row(row) -> dict | None:
+    return dict(row) if row is not None else None
+
+
+@api.get("/health")
+async def health():
+    pool = await db.get_pool()
+
+    async with pool.acquire() as conn:
+        await conn.fetchval("SELECT 1")
+
+    return {
+        "status": "healthy",
+        "service": "pipeline-autopilot",
+    }
 
 
 @api.get("/debug")
 async def debug():
-    return {"groq_key_set": bool(os.getenv("GROQ_API_KEY")), "google_creds_set": bool(os.getenv("GOOGLE_CREDENTIALS_JSON")),
-            "alerts_enabled": orchestrator.get_alerts_enabled(), **orchestrator.diagnostics()}
+    return {
+        "groq_key_set": bool(os.getenv("GROQ_API_KEY")),
+        "google_creds_set": bool(os.getenv("GOOGLE_CREDENTIALS_JSON")),
+        "alerts_enabled": orchestrator.get_alerts_enabled(),
+        **orchestrator.diagnostics(),
+    }
 
 
 @api.get("/")
 async def root():
-    return {"service": "pipeline-autopilot", "status": "online"}
+    return {
+        "service": "pipeline-autopilot",
+        "status": "online",
+    }
 
 
 @api.get("/playbook")
@@ -83,76 +116,168 @@ async def get_playbook():
 @api.get("/pipelines")
 async def list_pipelines():
     pool = await db.get_pool()
+
     async with pool.acquire() as conn:
-        pipelines = await conn.fetch("SELECT * FROM public.pipelines ORDER BY name")
+        pipelines = await conn.fetch(
+            "SELECT * FROM public.pipelines ORDER BY name"
+        )
+
         result = []
-        for p in pipelines:
+
+        for pipeline in pipelines:
             last = await conn.fetchrow(
-                """SELECT status, started_at, finished_at, rows_processed, rows_quarantined, run_id
-                   FROM public.pipeline_runs WHERE dag_id=$1 ORDER BY started_at DESC LIMIT 1""",
-                p["dag_id"])
-            pending = await conn.fetchval(
-                "SELECT count(*) FROM public.pipeline_runs WHERE dag_id=$1", p["dag_id"])
-            needs = await conn.fetchval(
-                "SELECT count(*) FROM public.audit_log WHERE pipeline_id=$1 AND status IN ('pending_approval','rejected')",
-                p["id"])
-            item = dict(p)
+                """
+                SELECT
+                    status,
+                    started_at,
+                    finished_at,
+                    rows_processed,
+                    rows_quarantined,
+                    run_id
+                FROM public.pipeline_runs
+                WHERE dag_id=$1
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                pipeline["dag_id"],
+            )
+
+            total_runs = await conn.fetchval(
+                """
+                SELECT count(*)
+                FROM public.pipeline_runs
+                WHERE dag_id=$1
+                """,
+                pipeline["dag_id"],
+            )
+
+            needs_approval = await conn.fetchval(
+                """
+                SELECT count(*)
+                FROM public.audit_log
+                WHERE pipeline_id=$1
+                  AND status IN ('pending_approval','rejected')
+                """,
+                pipeline["id"],
+            )
+
+            item = dict(pipeline)
             item["last_run"] = _row(last)
-            item["total_runs"] = pending
-            item["needs_approval"] = bool(needs)
+            item["total_runs"] = total_runs
+            item["needs_approval"] = bool(needs_approval)
+
             result.append(item)
+
         return result
 
 
 @api.get("/pipelines/{pipeline_id}")
 async def get_pipeline(pipeline_id: str):
     pool = await db.get_pool()
+
     async with pool.acquire() as conn:
-        p = await conn.fetchrow("SELECT * FROM public.pipelines WHERE id=$1", pipeline_id)
-        if p is None:
-            raise HTTPException(404, "pipeline not found")
+        pipeline = await conn.fetchrow(
+            "SELECT * FROM public.pipelines WHERE id=$1",
+            pipeline_id,
+        )
+
+        if pipeline is None:
+            raise HTTPException(
+                status_code=404,
+                detail="pipeline not found",
+            )
+
         runs = await conn.fetch(
-            """SELECT * FROM public.pipeline_runs WHERE dag_id=$1 ORDER BY started_at DESC LIMIT 15""",
-            p["dag_id"])
-        item = dict(p)
-        item["runs"] = [dict(r) for r in runs]
+            """
+            SELECT *
+            FROM public.pipeline_runs
+            WHERE dag_id=$1
+            ORDER BY started_at DESC
+            LIMIT 15
+            """,
+            pipeline["dag_id"],
+        )
+
+        item = dict(pipeline)
+        item["runs"] = [dict(run) for run in runs]
+
         return item
 
 
 @api.get("/pipelines/{pipeline_id}/failures")
 async def get_failures(pipeline_id: str):
     pool = await db.get_pool()
+
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT * FROM public.audit_log
-               WHERE pipeline_id=$1 AND status IN ('pending_approval','rejected')
-               ORDER BY created_at DESC""",
-            pipeline_id)
-        return [dict(r) for r in rows]
+            """
+            SELECT *
+            FROM public.audit_log
+            WHERE pipeline_id=$1
+              AND status IN ('pending_approval','rejected')
+            ORDER BY created_at DESC
+            """,
+            pipeline_id,
+        )
+
+        return [dict(row) for row in rows]
 
 
 @api.post("/pipelines/{pipeline_id}/approve")
-async def approve(pipeline_id: str, req: ApprovalRequest):
+async def approve(
+    pipeline_id: str,
+    request: ApprovalRequest,
+):
     try:
-        return await orchestrator.approve_fix(pipeline_id, req.audit_id, req.approved_by)
-    except ValueError as e:
-        raise HTTPException(404, str(e))
+        return await orchestrator.approve_fix(
+            pipeline_id,
+            request.audit_id,
+            request.approved_by,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
 
 
 @api.post("/pipelines/{pipeline_id}/reject")
-async def reject(pipeline_id: str, req: RejectRequest):
+async def reject(
+    pipeline_id: str,
+    request: RejectRequest,
+):
     try:
-        return await orchestrator.reject_fix(pipeline_id, req.audit_id, req.rejected_by, req.reason)
-    except ValueError as e:
-        raise HTTPException(404, str(e))
+        return await orchestrator.reject_fix(
+            pipeline_id,
+            request.audit_id,
+            request.rejected_by,
+            request.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
 
 
 @api.post("/pipelines/{pipeline_id}/manual-fix")
-async def manual_fix(pipeline_id: str, req: ManualFixRequest):
+async def manual_fix(
+    pipeline_id: str,
+    request: ManualFixRequest,
+):
     try:
-        return await orchestrator.manual_fix(pipeline_id, req.audit_id, req.fixed_by, req.action, req.instruction)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+        return await orchestrator.manual_fix(
+            pipeline_id,
+            request.audit_id,
+            request.fixed_by,
+            request.action,
+            request.instruction,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
 
 
 @api.get("/audit")
@@ -162,71 +287,193 @@ async def get_audit(
     since: str | None = Query(None),
 ):
     pool = await db.get_pool()
-    clauses, args = [], []
+
+    clauses = []
+    args = []
+
     if pipeline_id:
-        args.append(pipeline_id); clauses.append(f"pipeline_id=${len(args)}")
+        args.append(pipeline_id)
+        clauses.append(f"pipeline_id=${len(args)}")
+
     if status:
-        args.append(status); clauses.append(f"status=${len(args)}")
+        args.append(status)
+        clauses.append(f"status=${len(args)}")
+
     if since:
         try:
-            dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(
+                since.replace("Z", "+00:00")
+            )
         except ValueError:
-            raise HTTPException(400, "invalid 'since' timestamp")
-        args.append(dt); clauses.append(f"created_at >= ${len(args)}")
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            raise HTTPException(
+                status_code=400,
+                detail="invalid 'since' timestamp",
+            )
+
+        args.append(parsed)
+        clauses.append(f"created_at >= ${len(args)}")
+
+    where = (
+        "WHERE " + " AND ".join(clauses)
+        if clauses
+        else ""
+    )
+
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            f"SELECT * FROM public.audit_log {where} ORDER BY created_at DESC LIMIT 500", *args)
-        return [dict(r) for r in rows]
+            f"""
+            SELECT *
+            FROM public.audit_log
+            {where}
+            ORDER BY created_at DESC
+            LIMIT 500
+            """,
+            *args,
+        )
+
+        return [dict(row) for row in rows]
 
 
 @api.get("/pipelines/{pipeline_id}/lineage")
 async def get_lineage(pipeline_id: str):
     pool = await db.get_pool()
+
     async with pool.acquire() as conn:
         counts = {}
-        for tbl in ["bronze.raw_trends", "silver.trends_clean", "gold.trending_terms", "gold.region_leaders"]:
-            try:
-                counts[tbl] = await conn.fetchval(f"SELECT count(*) FROM {tbl}")
-            except Exception:
-                counts[tbl] = 0
-        pipe = await conn.fetchrow("SELECT status FROM public.pipelines WHERE id=$1", pipeline_id)
-    health = pipe["status"] if pipe else "healthy"
 
-    def node(nid, label, table, layer, x, y):
-        return {"id": nid, "label": label, "rows": counts.get(table, 0), "layer": layer,
-                "x": x, "y": y, "health": health if layer != "source" else "healthy"}
+        for table in [
+            "bronze.raw_trends",
+            "silver.trends_clean",
+            "gold.trending_terms",
+            "gold.region_leaders",
+        ]:
+            try:
+                counts[table] = await conn.fetchval(
+                    f"SELECT count(*) FROM {table}"
+                )
+            except Exception:
+                counts[table] = 0
+
+        pipeline = await conn.fetchrow(
+            "SELECT status FROM public.pipelines WHERE id=$1",
+            pipeline_id,
+        )
+
+    health = pipeline["status"] if pipeline else "healthy"
+
+    def node(
+        node_id,
+        label,
+        table,
+        layer,
+        x,
+        y,
+    ):
+        return {
+            "id": node_id,
+            "label": label,
+            "rows": counts.get(table, 0),
+            "layer": layer,
+            "x": x,
+            "y": y,
+            "health": health if layer != "source" else "healthy",
+        }
 
     nodes = [
-        node("src", "Google Trends (BigQuery)", None, "source", 0, 120),
-        node("b_trends", "bronze.raw_trends", "bronze.raw_trends", "bronze", 260, 120),
-        node("s_trends", "silver.trends_clean", "silver.trends_clean", "silver", 540, 120),
-        node("g_terms", "gold.trending_terms", "gold.trending_terms", "gold", 820, 40),
-        node("g_region", "gold.region_leaders", "gold.region_leaders", "gold", 820, 200),
+        node(
+            "src",
+            "Google Trends (BigQuery)",
+            None,
+            "source",
+            0,
+            120,
+        ),
+        node(
+            "b_trends",
+            "bronze.raw_trends",
+            "bronze.raw_trends",
+            "bronze",
+            260,
+            120,
+        ),
+        node(
+            "s_trends",
+            "silver.trends_clean",
+            "silver.trends_clean",
+            "silver",
+            540,
+            120,
+        ),
+        node(
+            "g_terms",
+            "gold.trending_terms",
+            "gold.trending_terms",
+            "gold",
+            820,
+            40,
+        ),
+        node(
+            "g_region",
+            "gold.region_leaders",
+            "gold.region_leaders",
+            "gold",
+            820,
+            200,
+        ),
     ]
-    edges = [["src", "b_trends"], ["b_trends", "s_trends"], ["s_trends", "g_terms"], ["s_trends", "g_region"]]
-    return {"nodes": nodes, "edges": [{"source": s, "target": t} for s, t in edges]}
+
+    edges = [
+        ["src", "b_trends"],
+        ["b_trends", "s_trends"],
+        ["s_trends", "g_terms"],
+        ["s_trends", "g_region"],
+    ]
+
+    return {
+        "nodes": nodes,
+        "edges": [
+            {
+                "source": source,
+                "target": target,
+            }
+            for source, target in edges
+        ],
+    }
 
 
 @api.post("/demo/trigger")
-async def demo_trigger(error_type: str = Query("row_count_anomaly")):
-    return await orchestrator.trigger_demo(error_type)
+async def demo_trigger(
+    error_type: str = Query("row_count_anomaly"),
+):
+    try:
+        return await orchestrator.trigger_demo(error_type)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
 
 
 @api.get("/alerts/status")
 async def get_alert_status():
-    return {"enabled": orchestrator.get_alerts_enabled()}
+    return {
+        "enabled": orchestrator.get_alerts_enabled(),
+    }
 
 
 @api.post("/alerts/toggle")
 async def toggle_alerts(body: AlertToggle):
     orchestrator.set_alerts_enabled(body.enabled)
-    return {"enabled": body.enabled}
+
+    return {
+        "enabled": body.enabled,
+    }
 
 
 @app.websocket("/api/ws/pipelines")
 async def ws_pipelines(ws: WebSocket):
     await manager.connect(ws)
+
     try:
         while True:
             await ws.receive_text()
@@ -237,7 +484,11 @@ async def ws_pipelines(ws: WebSocket):
 
 
 app.include_router(api)
+
 app.add_middleware(
-    CORSMiddleware, allow_credentials=True, allow_origins=["*"],
-    allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
