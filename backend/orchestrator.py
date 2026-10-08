@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import random
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -24,7 +25,9 @@ except Exception:
 
 log = structlog.get_logger(__name__)
 
-TICK_SECONDS = max(10, int(os.getenv("TICK_SECONDS", "30")))
+TICK_SECONDS = max(10, int(os.getenv("TICK_SECONDS", "45")))
+FAILURE_CHANCE = float(os.getenv("FAILURE_CHANCE", "0.65"))
+BATCH_TTL = int(os.getenv("BATCH_CACHE_SECONDS", "3600"))  # Google refreshes daily; avoid re-querying BigQuery
 INITIAL_DELAY_SECONDS = max(0, int(os.getenv("INITIAL_DELAY_SECONDS", "5")))
 DEMO_PIPELINE = "trends_ingest"
 ROUTINE_TYPES = [
@@ -43,7 +46,8 @@ _last_tick: str | None = None
 _ticks = 0
 _rows_in_batch = 0
 _bigquery_ok: bool | None = None
-_alerts_enabled = True
+_alerts_enabled = os.getenv("ALERTS_DEFAULT", "true").lower() == "true"
+_batch_cache: dict[str, Any] = {"rows": None, "ts": 0.0}
 _held: dict[str, list[dict[str, Any]]] = {}
 _last_good: dict[str, list[dict[str, Any]]] = {}
 
@@ -199,14 +203,39 @@ async def _update_audit(conn, audit_id: str, status: str, action: str, explanati
 
 
 async def _get_batch() -> list[dict[str, Any]]:
+    """BigQuery batch, cached so we stay far inside the free 1 TB/month."""
     global _bigquery_ok
+    cached = _batch_cache["rows"]
+    if cached and time.time() - _batch_cache["ts"] < BATCH_TTL:
+        return [dict(r) for r in cached]
     try:
         rows = await asyncio.to_thread(ds.fetch_batch_sync)
         _bigquery_ok = True
+        if rows:
+            _batch_cache.update(rows=rows, ts=time.time())
         return [dict(r) for r in rows]
     except Exception:
         _bigquery_ok = False
+        if cached:  # keep running on the last batch if BigQuery hiccups
+            log.warning("bigquery_failed_using_cached_batch")
+            return [dict(r) for r in cached]
         raise
+
+
+async def _record_run(conn, pipeline_id: str, status: str, rows: int, quarantined: int = 0) -> str:
+    dag_id = _pipeline(pipeline_id)["dag_id"]
+    run_id = f"scheduled__{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{random.randint(100, 999)}"
+    await conn.execute(
+        """INSERT INTO public.pipeline_runs (dag_id,run_id,status,started_at,finished_at,rows_processed,rows_quarantined)
+           VALUES ($1,$2,$3, now() - interval '4 seconds', now(), $4, $5)""",
+        dag_id, run_id, status, rows, quarantined)
+    return run_id
+
+
+async def _set_status(conn, pipeline_id: str, status: str) -> None:
+    await conn.execute(
+        "UPDATE public.pipelines SET status=$2, next_run=now() + interval '1 hour' WHERE id=$1",
+        pipeline_id, status)
 
 
 async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = None,
@@ -229,6 +258,14 @@ async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = 
             await ds.load(conn, rows)
             await _save_good(conn, pipeline_id, rows)
             good = rows
+
+        if not forced_error_type and random.random() > FAILURE_CHANCE:   # healthy run
+            await ds.load(conn, rows)
+            await _save_good(conn, pipeline_id, rows)
+            await _record_run(conn, pipeline_id, "success", len(rows), 0)
+            await _set_status(conn, pipeline_id, "healthy")
+            await _broadcast("pipeline_success", {"pipeline_id": pipeline_id, "status": "healthy"})
+            return {"pipeline_id": pipeline_id, "status": "healthy", "rows_processed": len(rows)}
 
         if forced_error_type:
             error_type = forced_error_type
@@ -275,6 +312,8 @@ async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = 
         )
 
         if critical:
+            await _record_run(conn, pipeline_id, "failed", len(bad_rows), 0)
+            await _set_status(conn, pipeline_id, "critical")
             _held[audit_id] = [dict(r) for r in bad_rows]
             await _broadcast("critical_failure", {
                 "pipeline_id": pipeline_id, "audit_id": audit_id,
@@ -317,6 +356,8 @@ async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = 
             conn, audit_id, "auto_fixed", action,
             f"Automatically applied whitelisted action '{action}'. Quarantined {quarantined} rows.",
         )
+        await _record_run(conn, pipeline_id, "success", len(fixed), quarantined)
+        await _set_status(conn, pipeline_id, "healthy")
         await _broadcast("auto_fixed", {
             "pipeline_id": pipeline_id, "audit_id": audit_id,
             "error_type": error_type, "status": "auto_fixed",
@@ -339,20 +380,34 @@ async def run_pipeline_once(pipeline_id: str) -> dict[str, Any]:
         return {"pipeline_id": pipeline_id, "status": "error", "error": str(exc)}
 
 
+async def _sync_state_on_boot() -> None:
+    """After a restart, rebuild pipeline status from the persisted audit log (nothing starts from zero)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE public.pipelines p SET status='critical' WHERE EXISTS (
+               SELECT 1 FROM public.audit_log a WHERE a.pipeline_id=p.id
+               AND a.status IN ('pending_approval','rejected'))""")
+
+
 async def scheduler_loop() -> None:
-    global _ticks, _last_tick
+    global _ticks, _last_tick, _last_error
     await asyncio.sleep(INITIAL_DELAY_SECONDS)
+    try:
+        await _sync_state_on_boot()
+    except Exception as exc:
+        log.warning("boot_sync_failed", error=str(exc))
+    log.info("orchestrator_started", tick_seconds=TICK_SECONDS)
     while True:
         try:
+            pipeline = PIPELINES[_ticks % len(PIPELINES)]   # one pipeline per tick, round-robin
             _ticks += 1
             _last_tick = _now()
-            for pipeline in PIPELINES:
-                await run_pipeline_once(pipeline["id"])
+            await run_pipeline_once(pipeline["id"])
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.exception("scheduler_tick_failed", error=str(exc))
-            global _last_error
             _last_error = str(exc)
         await asyncio.sleep(TICK_SECONDS)
 
@@ -418,6 +473,8 @@ async def approve_fix(pipeline_id: str, audit_id: str, approved_by: str) -> dict
         await _save_good(conn, pipeline_id, good)
         await _update_audit(conn, audit_id, "approved", "reload_last_good_batch",
                             f"Approved by {approved_by}; restored the last known-good batch.")
+        await _record_run(conn, pipeline_id, "success", len(good), 0)
+        await _set_status(conn, pipeline_id, "healthy")
     _held.pop(audit_id, None)
     await _broadcast("critical_resolved", {"pipeline_id": pipeline_id,
                     "audit_id": audit_id, "status": "approved", "approved_by": approved_by})
@@ -477,6 +534,8 @@ async def manual_fix(pipeline_id: str, audit_id: str, fixed_by: str,
             await _save_good(conn, pipeline_id, rows)
         await _update_audit(conn, audit_id, "manually_fixed", action,
                             f"Manual remediation completed by {fixed_by} using {ds.MANUAL_ACTIONS[action]}.")
+        await _record_run(conn, pipeline_id, "success", len(rows) if action != "skip_and_keep_previous" else 0, 0)
+        await _set_status(conn, pipeline_id, "healthy")
     _held.pop(audit_id, None)
     await _broadcast("manual_fix_completed", {"pipeline_id": pipeline_id,
                     "audit_id": audit_id, "status": "manually_fixed",
