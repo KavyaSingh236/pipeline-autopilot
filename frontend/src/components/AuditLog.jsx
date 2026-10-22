@@ -1,3 +1,5 @@
+import { useState, useEffect } from "react";
+import { useSearchParams } from "react-router-dom";
 import { fmtTime } from "@/components/status";
 
 const OUTCOME_COLOR = {
@@ -15,6 +17,9 @@ const PIPE_LABEL = {
 };
 
 export default function AuditLog({ rows }) {
+  const [params, setParams] = useSearchParams();
+  const [expanded, setExpanded] = useState(params.get("incident"));
+  useEffect(() => { if (params.get("incident")) setExpanded(params.get("incident")); }, [params]);
   if (!rows?.length) {
     return (
       <div className="border border-white/10 bg-[#0A0A0A] p-12 text-center text-white/40 text-sm" data-testid="audit-empty">
@@ -33,10 +38,18 @@ export default function AuditLog({ rows }) {
           </tr>
         </thead>
         <tbody>
-          {rows.map((r) => (
-            <tr key={r.id} className="hover:bg-white/5 transition-colors" data-testid={`audit-row-${r.id}`}>
+          {rows.map((r) => (<ReactRow key={r.id} r={r} expanded={expanded === String(r.id)} toggle={() => { const next = expanded === String(r.id) ? null : String(r.id); setExpanded(next); if (next) setParams({incident: next}); else setParams({}); }} />))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ReactRow({r,expanded,toggle}) {
+ return <>
+            <tr className="hover:bg-white/5 transition-colors" data-testid={`audit-row-${r.id}`}>
               <td className="px-4 py-3 border-b border-white/5 font-mono text-xs text-white/70 whitespace-nowrap">
-                {fmtTime(r.created_at)}
+                <button onClick={toggle} aria-expanded={expanded} className="text-[#00E5FF] hover:underline focus:outline-none focus:underline">{fmtTime(r.created_at)} {expanded ? "▴" : "▾"}</button>
               </td>
               <td className="px-4 py-3 border-b border-white/5 font-mono text-xs text-white/90 whitespace-nowrap">
                 {PIPE_LABEL[r.pipeline_id] || r.pipeline_id}
@@ -73,9 +86,12 @@ export default function AuditLog({ rows }) {
                 </span>
               </td>
             </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
+            {expanded && <tr><td colSpan={6} className="px-6 py-5 bg-[#10151B] border-b border-[#00E5FF]/30">
+              <div className="grid md:grid-cols-2 gap-5 text-xs font-mono break-words">
+                {[["Error detected", r.description], ["Root cause", r.root_cause], ["Diagnosis source", r.model || "Not recorded"], ["Recommended fix", r.proposed_fix], ["Executed action", r.action], ["Result / human decision", r.outcome], ["Operator", r.approved_by], ["Validation evidence / error log", r.error_log], ["Downstream impact", r.downstream_impact], ["Risk if approved", r.risk_if_approved], ["Risk if rejected", r.risk_if_rejected], ["Affected rows", r.rows_affected]].filter(([,v]) => v !== null && v !== undefined && v !== "").map(([label,value]) => (
+                  <div key={label}><div className="uppercase tracking-widest text-[10px] text-[#00E5FF]/70 mb-2">{label}</div><div className="text-white/75 whitespace-pre-wrap">{String(value)}</div></div>
+                ))}
+              </div>
+            </td></tr>}
+ </>;
 }

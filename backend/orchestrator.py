@@ -271,6 +271,14 @@ async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = 
         else:
             failure_number = await _next_failure_number(conn) if count_cycle else 1
             severity = "critical" if failure_number == 8 else "routine"
+            # One pending critical incident system-wide. Keep other pipelines
+            # processing routine errors instead of filling all three queues.
+            if severity == "critical":
+                open_critical = await conn.fetchval("""SELECT 1 FROM public.audit_log
+                    WHERE status IN ('pending_approval','rejected') LIMIT 1""")
+                if open_critical:
+                    severity = "routine"
+                    failure_number = 1
             error_type = None
 
         plan = await agents.generate_failure(

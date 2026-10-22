@@ -1,17 +1,20 @@
 import { useEffect, useState, useCallback } from "react";
 import { Link } from "react-router-dom";
 import { motion } from "framer-motion";
-import { AlertTriangle, ArrowRight } from "lucide-react";
+import { AlertTriangle, ArrowRight, CheckCircle2, UserRoundCheck, Clock3 } from "lucide-react";
 import PipelineCard from "@/components/PipelineCard";
-import { getPipelines } from "@/lib/api";
+import { getPipelines, getAudit } from "@/lib/api";
 
 export default function ControlTower({ lastEvent }) {
   const [pipelines, setPipelines] = useState([]);
+  const [recent, setRecent] = useState([]);
   const [now, setNow] = useState(new Date());
 
   const load = useCallback(async () => {
     try {
-      setPipelines(await getPipelines());
+      const [p, a] = await Promise.all([getPipelines(), getAudit({})]);
+      setPipelines(p);
+      setRecent(a.filter(r => ["auto_fixed", "approved", "manually_fixed", "rejected", "pending_approval"].includes(r.status)).slice(0, 5));
     } catch (e) {}
   }, []);
 
@@ -84,6 +87,23 @@ export default function ControlTower({ lastEvent }) {
           <PipelineCard key={p.id} pipeline={p} index={i} />
         ))}
       </div>
+      <section className="mt-10 border border-white/10 bg-[#0A0A0A]" data-testid="recent-resolutions">
+        <div className="flex items-center justify-between border-b border-white/10 px-6 py-5 gap-4">
+          <div><h2 className="text-lg font-display uppercase tracking-wider">Recent Resolutions</h2>
+            <p className="text-xs text-white/40 mt-1">Latest five detected failures and their outcomes</p></div>
+          <Link to="/audit" className="text-[#00E5FF] text-xs font-mono uppercase flex items-center gap-2 hover:underline">View all <ArrowRight size={14}/></Link>
+        </div>
+        {recent.length === 0 ? <p className="p-6 text-sm text-white/40">No incidents recorded yet.</p> : recent.map(r => (
+          <Link to={`/audit?incident=${encodeURIComponent(r.id)}`} key={r.id} className="flex flex-wrap items-center gap-3 justify-between px-6 py-4 border-b border-white/5 hover:bg-white/5 transition-colors">
+            <div className="flex items-start gap-3 min-w-0">
+              {r.status === "pending_approval" ? <Clock3 size={17} className="text-[#FFCC00] shrink-0"/> : r.status === "manually_fixed" || r.status === "approved" ? <UserRoundCheck size={17} className="text-[#B388FF] shrink-0"/> : <CheckCircle2 size={17} className="text-[#00E5FF] shrink-0"/>}
+              <div className="min-w-0"><div className="text-sm text-white/90 font-medium">{(r.error_type || "Unknown error").replaceAll("_", " ")}</div>
+                <div className="text-xs text-white/50 mt-1 break-words">{r.outcome || r.explanation || r.proposed_fix || r.description || "Awaiting resolution"}</div>
+                <div className="text-[10px] text-white/30 mt-1 font-mono">{r.pipeline_id} · {r.created_at ? new Date(r.created_at).toLocaleString() : ""}</div></div>
+            </div><span className={`text-[10px] font-mono tracking-wider uppercase border px-2 py-1 ${r.status === "pending_approval" ? "text-[#FFCC00] border-[#FFCC00]/50" : r.status === "manually_fixed" || r.status === "approved" ? "text-[#B388FF] border-[#B388FF]/50" : "text-[#00E5FF] border-[#00E5FF]/50"}`}>{r.status.replaceAll("_", " ")}</span>
+          </Link>
+        ))}
+      </section>
     </div>
   );
 }
