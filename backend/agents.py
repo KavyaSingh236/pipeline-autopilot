@@ -36,7 +36,7 @@ def model_name() -> str:
     return os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 
-async def _chat(client, system: str, user: str) -> dict | None:
+async def _chat(client, system: str, user: str, model: str | None = None) -> dict | None:
     key = os.getenv("GROQ_API_KEY", "")
     if not key or client is None:
         return None
@@ -47,7 +47,7 @@ async def _chat(client, system: str, user: str) -> dict | None:
             timeout=25,
             headers={"Authorization": f"Bearer {key}"},
             json={
-                "model": model_name(),
+                "model": model or model_name(),
                 "temperature": 0.3,
                 "response_format": {"type": "json_object"},
                 "messages": [
@@ -69,6 +69,39 @@ async def _chat(client, system: str, user: str) -> dict | None:
         GROQ_STATUS.update(last_ok=False, last_error=f"{type(exc).__name__}: {str(exc)[:150]} {body}")
         log.warning("groq_call_failed", error=str(exc))
         return None
+
+
+MODEL_STATUS = {"gemini": {"last_ok": None, "last_error": None}, "remediation": {"last_ok": None, "last_error": None}}
+
+
+async def diagnose_with_gemini(client, error_type: str, error_log: str, findings: list[dict]) -> dict:
+    key = os.getenv("GEMINI_API_KEY", "")
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    if not key or client is None:
+        MODEL_STATUS["gemini"]["last_error"] = "GEMINI_API_KEY not configured"
+        return {}
+    prompt = (
+        "You are an ETL root-cause analyst. Use only the supplied validator evidence and logs. "
+        "Do not invent an observed cause. Respond with a JSON object containing root_cause, "
+        "confidence (0 to 1), evidence, and affected_stage. "
+        f"Error type: {error_type}. Logs: {error_log}. Findings: {json.dumps(findings)}"
+    )
+    try:
+        response = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {"responseMimeType": "application/json"}},
+            timeout=18,
+        )
+        response.raise_for_status()
+        result = json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+        MODEL_STATUS["gemini"].update(last_ok=True, last_error=None)
+        return result if isinstance(result, dict) else {}
+    except Exception as exc:
+        MODEL_STATUS["gemini"].update(last_ok=False, last_error=str(exc)[:300])
+        log.warning("gemini_diagnosis_failed", error=str(exc))
+        return {}
 
 
 async def generate_failure(
@@ -257,6 +290,7 @@ async def remediation_agent(
     error_type: str,
     error_log: str,
     findings: list[dict],
+    diagnosis: dict | None = None,
 ) -> dict:
     auto_action = ALLOWED_ACTION[error_type]
     playbook = ERROR_PLAYBOOK[error_type]
@@ -264,7 +298,7 @@ async def remediation_agent(
     out = await _chat(
         client,
         (
-            "You are Agent 2, the Remediation Agent. Diagnose the ETL incident using "
+            "You are Agent 3, the Remediation Planner. Use the diagnosis and ETL evidence from "
             "the error log and validator evidence. Choose one action from the "
             "available automatic actions. The system will enforce a hard playbook "
             "guardrail before executing it. For a critical row_count_anomaly, "
@@ -276,8 +310,10 @@ async def remediation_agent(
             f"Error type: {error_type}\n"
             f"Error log:\n{error_log}\n\n"
             f"Validator evidence:\n{json.dumps(findings)}\n\n"
+            f"Independent root cause analysis: {json.dumps(diagnosis or {})}\n\n"
             f"Automatic playbook action: {auto_action}"
         ),
+        model=os.getenv("REMEDIATION_GROQ_MODEL", "openai/gpt-oss-120b"),
     )
 
     if not out:
@@ -333,7 +369,7 @@ async def remediation_agent(
         ) + note,
         "risk": str(out.get("risk", "low")),
         "confidence": confidence,
-        "model": model_name(),
+        "model": os.getenv("REMEDIATION_GROQ_MODEL", "openai/gpt-oss-120b"),
         "recommendation": recommendation,
         "downstream_impact": str(
             out.get("downstream_impact", "")

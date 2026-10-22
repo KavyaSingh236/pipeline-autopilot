@@ -26,9 +26,9 @@ except Exception:
 log = structlog.get_logger(__name__)
 
 TICK_SECONDS = max(10, int(os.getenv("TICK_SECONDS", "45")))
-FAILURE_CHANCE = float(os.getenv("FAILURE_CHANCE", "0.65"))
+FAILURE_CHANCE = float(os.getenv("FAILURE_CHANCE", "1.0"))
 BATCH_TTL = int(os.getenv("BATCH_CACHE_SECONDS", "3600"))  # Google refreshes daily; avoid re-querying BigQuery
-INITIAL_DELAY_SECONDS = max(0, int(os.getenv("INITIAL_DELAY_SECONDS", "5")))
+INITIAL_DELAY_SECONDS = max(0, int(os.getenv("INITIAL_DELAY_SECONDS", "1")))
 DEMO_PIPELINE = "trends_ingest"
 ROUTINE_TYPES = [
     "schema_mismatch",
@@ -48,6 +48,7 @@ _rows_in_batch = 0
 _bigquery_ok: bool | None = None
 _alerts_enabled = os.getenv("ALERTS_DEFAULT", "true").lower() == "true"
 _batch_cache: dict[str, Any] = {"rows": None, "ts": 0.0}
+_batch_lock = asyncio.Lock()
 _held: dict[str, list[dict[str, Any]]] = {}
 _last_good: dict[str, list[dict[str, Any]]] = {}
 
@@ -88,15 +89,11 @@ async def _ensure_state(conn) -> None:
 async def _next_failure_number(conn) -> int:
     await _ensure_state(conn)
     row = await conn.fetchrow(
-        "SELECT failure_count FROM public.orchestrator_state WHERE id=1 FOR UPDATE"
+        """UPDATE public.orchestrator_state
+           SET failure_count = CASE WHEN failure_count >= 7 THEN 0 ELSE failure_count + 1 END
+           WHERE id=1 RETURNING failure_count"""
     )
-    current = int(row["failure_count"]) if row else 0
-    number = 1 if current >= 8 else current + 1
-    await conn.execute(
-        "UPDATE public.orchestrator_state SET failure_count=$1 WHERE id=1",
-        0 if number == 8 else number,
-    )
-    return number
+    return 8 if int(row["failure_count"]) == 0 else int(row["failure_count"])
 
 
 async def _load_good(conn, pipeline_id: str) -> list[dict[str, Any]]:
@@ -197,29 +194,29 @@ async def _update_audit(conn, audit_id: str, status: str, action: str, explanati
         """UPDATE public.audit_log SET status=$1,action=$2,explanation=$3,
            outcome=$3,resolved_at=CASE WHEN $1 IN
            ('approved','manually_fixed','auto_fixed') THEN NOW() ELSE resolved_at END
-           WHERE id=$4""",
+           WHERE id=$4::text::uuid""",
         status, action, explanation, audit_id,
     )
 
 
 async def _get_batch() -> list[dict[str, Any]]:
-    """BigQuery batch, cached so we stay far inside the free 1 TB/month."""
     global _bigquery_ok
-    cached = _batch_cache["rows"]
-    if cached and time.time() - _batch_cache["ts"] < BATCH_TTL:
-        return [dict(r) for r in cached]
-    try:
-        rows = await asyncio.to_thread(ds.fetch_batch_sync)
-        _bigquery_ok = True
-        if rows:
-            _batch_cache.update(rows=rows, ts=time.time())
-        return [dict(r) for r in rows]
-    except Exception:
-        _bigquery_ok = False
-        if cached:  # keep running on the last batch if BigQuery hiccups
-            log.warning("bigquery_failed_using_cached_batch")
+    async with _batch_lock:
+        cached = _batch_cache["rows"]
+        if cached and time.time() - _batch_cache["ts"] < BATCH_TTL:
             return [dict(r) for r in cached]
-        raise
+        try:
+            rows = await asyncio.to_thread(ds.fetch_batch_sync)
+            _bigquery_ok = True
+            if rows:
+                _batch_cache.update(rows=rows, ts=time.time())
+            return [dict(r) for r in rows]
+        except Exception:
+            _bigquery_ok = False
+            if cached:
+                log.warning("bigquery_failed_using_cached_batch")
+                return [dict(r) for r in cached]
+            raise
 
 
 async def _record_run(conn, pipeline_id: str, status: str, rows: int, quarantined: int = 0) -> str:
@@ -251,7 +248,7 @@ async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = 
         rows = await _get_batch()
         _rows_in_batch = len(rows)
         if not rows:
-            raise RuntimeError("BigQuery returned no rows.")
+            raise RuntimeError("BigQuery returned no rows. Check GOOGLE_CREDENTIALS_JSON, BigQuery API access, public Google Trends dataset, and query date window.")
 
         good = await _load_good(conn, pipeline_id)
         if not good:
@@ -289,6 +286,12 @@ async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = 
         )
         if error_type == "row_count_anomaly":
             bad_rows = random.sample(rows, max(1, int(len(rows) * 0.4)))
+        await conn.execute(
+            """INSERT INTO public.pipeline_working_batches(pipeline_id,row_data,error_type,updated_at)
+               VALUES($1,$2::jsonb,$3,NOW()) ON CONFLICT(pipeline_id)
+               DO UPDATE SET row_data=EXCLUDED.row_data,error_type=EXCLUDED.error_type,updated_at=NOW()""",
+            pipeline_id, json.dumps(_jsonable(bad_rows)), error_type,
+        )
         findings = ds.validate(bad_rows, len(good))
         if not findings:
             findings = [{"type": error_type, "detail": f"Controlled {error_type} injected for incident testing."}]
@@ -296,9 +299,13 @@ async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = 
             _client, pipeline, error_type, findings, len(bad_rows),
             str(plan.get("scenario", "")),
         )
+        root_analysis = await agents.diagnose_with_gemini(_client, error_type, error_log, findings)
         diagnosis = await agents.remediation_agent(
-            _client, error_type, error_log, findings
+            _client, error_type, error_log, findings, root_analysis
         )
+        if root_analysis.get("root_cause"):
+            diagnosis["root_cause"] = str(root_analysis["root_cause"])[:500]
+            diagnosis["diagnostic_model"] = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         diagnosis["model"] = diagnosis.get("model") or log_model
         diagnosis["action"] = diagnosis.get("action") or ds.ALLOWED_ACTION[error_type]
         critical = error_type in CRITICAL_TYPES
@@ -344,12 +351,15 @@ async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = 
 
         action = ds.ALLOWED_ACTION[error_type]
         fixed, quarantined = ds.apply_fix(action, bad_rows, good)
-        if not fixed:
-            fixed = good
         remaining = ds.validate(fixed, len(good))
         if remaining:
-            log.warning("auto_fix_validation_findings", pipeline_id=pipeline_id,
-                        findings=remaining)
+            log.error("auto_fix_validation_failed", pipeline_id=pipeline_id, findings=remaining)
+            await _update_audit(conn, audit_id, "pending_approval", action,
+                                "Automatic fix did not pass revalidation; human review required.")
+            await _record_run(conn, pipeline_id, "failed", len(bad_rows), quarantined)
+            await _set_status(conn, pipeline_id, "critical")
+            return {"pipeline_id": pipeline_id, "audit_id": audit_id,
+                    "status": "pending_approval", "error_type": error_type}
         await ds.load(conn, fixed)
         await _save_good(conn, pipeline_id, fixed)
         await _update_audit(
@@ -400,10 +410,15 @@ async def scheduler_loop() -> None:
     log.info("orchestrator_started", tick_seconds=TICK_SECONDS)
     while True:
         try:
-            pipeline = PIPELINES[_ticks % len(PIPELINES)]   # one pipeline per tick, round-robin
             _ticks += 1
             _last_tick = _now()
-            await run_pipeline_once(pipeline["id"])
+            # Run each pipeline on every tick, but serialize writes to shared
+            # bronze/silver/gold tables to avoid competing TRUNCATE/UPSERT operations.
+            for pipeline in PIPELINES:
+                result = await run_pipeline_once(pipeline["id"])
+                if result.get("status") == "error":
+                    log.error("pipeline_tick_exception", pipeline_id=pipeline["id"],
+                              error=result.get("error"))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -442,7 +457,9 @@ def diagnostics() -> dict[str, Any]:
         "bigquery_ok": _bigquery_ok,
         "rows_in_batch": _rows_in_batch,
         "held_critical_events": len(_held),
-        "failure_cycle": "7 routine, 1 critical per 8 runs",
+        "failure_cycle": "7 routine incidents, 1 critical incident per 8 injected incidents",
+        "scheduler_running": _task is not None and not _task.done(),
+        "gemini": agents.MODEL_STATUS["gemini"],
     }
 
 
@@ -459,7 +476,7 @@ async def approve_fix(pipeline_id: str, audit_id: str, approved_by: str) -> dict
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM public.audit_log WHERE id=$1 AND pipeline_id=$2",
+            "SELECT * FROM public.audit_log WHERE id=$1::text::uuid AND pipeline_id=$2",
             audit_id, pipeline_id,
         )
         if not row:
@@ -487,7 +504,7 @@ async def reject_fix(pipeline_id: str, audit_id: str, rejected_by: str,
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM public.audit_log WHERE id=$1 AND pipeline_id=$2",
+            "SELECT * FROM public.audit_log WHERE id=$1::text::uuid AND pipeline_id=$2",
             audit_id, pipeline_id,
         )
         if not row:
@@ -513,7 +530,7 @@ async def manual_fix(pipeline_id: str, audit_id: str, fixed_by: str,
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM public.audit_log WHERE id=$1 AND pipeline_id=$2",
+            "SELECT * FROM public.audit_log WHERE id=$1::text::uuid AND pipeline_id=$2",
             audit_id, pipeline_id,
         )
         if not row:

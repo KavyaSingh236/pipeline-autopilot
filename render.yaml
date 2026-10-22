@@ -12,6 +12,12 @@ services:
         sync: false
       - key: GROQ_API_KEY
         sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: REMEDIATION_GROQ_MODEL
+        value: openai/gpt-oss-120b
       - key: GOOGLE_CREDENTIALS_JSON
         sync: false
       - key: RESEND_API_KEY
@@ -25,6 +31,6 @@ services:
       - key: INITIAL_DELAY_SECONDS
         value: "5"
       - key: FAILURE_CHANCE
-        value: "0.6"
+        value: "1.0"
       - key: PYTHON_VERSION
         value: 3.11.9

@@ -133,14 +133,16 @@ def apply_fix(action: str, rows: list[dict], last_good: list[dict]) -> tuple[lis
         return keep, len(rows) - len(keep)
     if action == "cast_types":
         out = []
+        quarantined = 0
         for r in rows:
             r = dict(r)
             try:
                 r["rank"] = int(r["rank"])
             except (TypeError, ValueError):
-                r["rank"] = None
+                quarantined += 1
+                continue
             out.append(r)
-        return out, 0
+        return out, quarantined
     if action == "dedupe_rows":
         seen, out = set(), []
         for r in rows:
@@ -168,13 +170,20 @@ async def load(conn, rows: list[dict]) -> None:
     async with conn.transaction():
         await conn.executemany(
             """INSERT INTO bronze.raw_trends (id,refresh_date,region,region_id,term,week,rank,score)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING""", recs)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET
+               refresh_date=EXCLUDED.refresh_date,region=EXCLUDED.region,
+               region_id=EXCLUDED.region_id,term=EXCLUDED.term,
+               week=EXCLUDED.week,rank=EXCLUDED.rank,score=EXCLUDED.score""", recs)
         await conn.execute("DELETE FROM bronze.raw_trends WHERE refresh_date < current_date - 7")
         await conn.execute("DELETE FROM silver.trends_clean WHERE refresh_date < current_date - 7")
         await conn.execute(
             """INSERT INTO silver.trends_clean (id,refresh_date,region,term,week,rank,score)
                SELECT id,refresh_date,trim(region),lower(trim(term)),week,rank,score
-               FROM bronze.raw_trends WHERE rank BETWEEN 1 AND 25 ON CONFLICT (id) DO NOTHING""")
+               FROM bronze.raw_trends WHERE rank BETWEEN 1 AND 25
+               ON CONFLICT (id) DO UPDATE SET
+               refresh_date=EXCLUDED.refresh_date,region=EXCLUDED.region,
+               term=EXCLUDED.term,week=EXCLUDED.week,
+               rank=EXCLUDED.rank,score=EXCLUDED.score""")
         await conn.execute("TRUNCATE gold.trending_terms")
         await conn.execute(
             """INSERT INTO gold.trending_terms

@@ -97,6 +97,8 @@ async def debug():
         "groq_key_set": bool(os.getenv("GROQ_API_KEY")),
         "groq_model": os.getenv("GROQ_MODEL", "(not set - default llama-3.3-70b-versatile)"),
         "groq": agents.GROQ_STATUS,
+        "model_agents": agents.MODEL_STATUS,
+        "gemini_key_set": bool(os.getenv("GEMINI_API_KEY")),
         "google_creds_set": bool(os.getenv("GOOGLE_CREDENTIALS_JSON")),
         "alerts_enabled": orchestrator.get_alerts_enabled(),
         **orchestrator.diagnostics(),

@@ -81,6 +81,20 @@ ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS risk_if_approved TEXT;
 ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS risk_if_rejected TEXT;
 ALTER TABLE public.audit_log ADD COLUMN IF NOT EXISTS alternatives TEXT;
 
+CREATE TABLE IF NOT EXISTS public.pipeline_good_batches (
+    pipeline_id TEXT PRIMARY KEY,
+    row_data JSONB NOT NULL,
+    row_count INTEGER NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.pipeline_working_batches (
+    pipeline_id TEXT PRIMARY KEY,
+    row_data JSONB NOT NULL,
+    error_type TEXT,
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS public.pipeline_runs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     dag_id TEXT NOT NULL,
