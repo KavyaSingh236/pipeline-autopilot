@@ -25,7 +25,7 @@ ALLOWED_ACTION = {
     "data_type_mismatch": "cast_types",
     "duplicate_records": "dedupe_rows",
     "invalid_range": "quarantine_out_of_range",
-    "row_count_anomaly": "reload_last_good_batch",
+    "row_count_anomaly": "retry_source_fetch",
 }
 
 # Manual choices for critical incidents.

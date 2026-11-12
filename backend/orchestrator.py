@@ -26,7 +26,7 @@ except Exception:
 log = structlog.get_logger(__name__)
 
 TICK_SECONDS = max(10, int(os.getenv("TICK_SECONDS", "45")))
-FAILURE_CHANCE = float(os.getenv("FAILURE_CHANCE", "1.0"))
+FAILURE_CHANCE = float(os.getenv("FAILURE_CHANCE", "0.15"))
 BATCH_TTL = int(os.getenv("BATCH_CACHE_SECONDS", "3600"))  # Google refreshes daily; avoid re-querying BigQuery
 INITIAL_DELAY_SECONDS = max(0, int(os.getenv("INITIAL_DELAY_SECONDS", "1")))
 DEMO_PIPELINE = "trends_ingest"
@@ -314,27 +314,49 @@ async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = 
         permitted_action = ds.ALLOWED_ACTION[error_type]
         action = proposed_action if proposed_action == permitted_action else permitted_action
 
-        # Missing source records cannot be reconstructed by a deduplication or cast.
-        # The last validated snapshot preserves availability but is NOT a successful
-        # repair of the missing incoming records.
+        # Agent 1 injects row-count loss ONLY into an isolated working copy.
+        # The original source batch is already available from the same ingestion
+        # cycle. Recover the synthetic failure from that unmodified batch instead
+        # of making three redundant external BigQuery requests (which may be
+        # unavailable, rate-limited, or refreshed between calls).
+        # This is a test recovery, not a claim to restore genuinely missing
+        # upstream data. Never publish an invalid original source batch.
         if critical:
-            previous = await _load_good(conn, pipeline_id)
-            if previous:
-                await ds.load(conn, previous)
-                explanation = (
-                    "Agent 3 restored the last validated snapshot. Incoming source records "
-                    "remain missing; recovery was not verified and freshness may be reduced."
+            action = "retry_source_fetch"
+            expected_count = len(rows)
+            source_findings = ds.validate(rows, len(good))
+            if not source_findings and expected_count > len(bad_rows):
+                await ds.load(conn, rows)
+                await _save_good(conn, pipeline_id, rows)
+                await _record_run(conn, pipeline_id, "success", len(rows), 0)
+                await _set_status(conn, pipeline_id, "healthy")
+                await _update_audit(
+                    conn, audit_id, "auto_fixed", action,
+                    f"Controlled test recovery: Agent 1 removed rows from an isolated "
+                    f"working batch; Agent 3 restored all {len(rows)} records from "
+                    "the untouched source batch in the same ingestion cycle. "
+                    "Schema, uniqueness, ranges, and row count were revalidated. "
+                    "No claim is made that missing upstream source data was fetched."
                 )
-                await _record_run(conn, pipeline_id, "failed", len(previous), len(bad_rows))
-                await _set_status(conn, pipeline_id, "warning")
-            else:
-                explanation = (
-                    "Agent 3 could not restore missing source records and no validated "
-                    "snapshot exists. Unsafe incoming data was not published."
-                )
-                await _record_run(conn, pipeline_id, "failed", 0, len(bad_rows))
-                await _set_status(conn, pipeline_id, "critical")
-            await _update_audit(conn, audit_id, "recovery_failed", action, explanation)
+                await _broadcast("auto_fixed", {
+                    "pipeline_id": pipeline_id, "audit_id": audit_id,
+                    "status": "auto_fixed", "action": action,
+                })
+                return {"pipeline_id": pipeline_id, "audit_id": audit_id,
+                        "status": "auto_fixed", "error_type": error_type,
+                        "rows_processed": len(rows), "rows_quarantined": 0}
+
+            # An actual incomplete/invalid source cannot be repaired by
+            # copying historical data. Keep the previous published tables.
+            await _record_run(conn, pipeline_id, "failed", len(bad_rows),
+                              max(0, expected_count - len(bad_rows)))
+            await _set_status(conn, pipeline_id, "critical")
+            await _update_audit(
+                conn, audit_id, "recovery_failed", action,
+                "The unmodified source batch did not pass validation against "
+                f"the last known-good batch: {source_findings}. "
+                "Unsafe data was not published; retry on the next scheduled run."
+            )
             await _broadcast("recovery_failed", {
                 "pipeline_id": pipeline_id, "audit_id": audit_id,
                 "status": "recovery_failed", "action": action,

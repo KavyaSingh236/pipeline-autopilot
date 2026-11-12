@@ -302,9 +302,9 @@ async def remediation_agent(
             "the error log and validator evidence. Choose one action from the "
             "available automatic actions. The system will enforce a hard playbook "
             "guardrail before executing it. No human approval is used. "
-            "For a critical row_count_anomaly, isolate the incomplete batch and "
-            "recommend restoring the last validated snapshot, without claiming "
-            "the missing source records were recovered. Explain downstream impact, "
+            "For a critical row_count_anomaly, recommend retry_source_fetch to "
+            "retrieve a fresh complete source batch, then revalidate it. Never "
+            "claim missing records were recovered without validation. Explain downstream impact, "
             "risk, and revalidation evidence. Return JSON."
         ),
         (

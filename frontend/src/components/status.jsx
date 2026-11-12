@@ -1,6 +1,6 @@
 export const STATUS = {
   healthy: { label: "HEALTHY", color: "#00FF66", dot: "#00FF66" },
-  warning: { label: "NEEDS APPROVAL", color: "#FFCC00", dot: "#FFCC00" },
+  warning: { label: "RECOVERY FAILED", color: "#FFCC00", dot: "#FFCC00" },
   critical: { label: "CRITICAL", color: "#FF0055", dot: "#FF0055" },
   running: { label: "RUNNING", color: "#00E5FF", dot: "#00E5FF" },
 };
