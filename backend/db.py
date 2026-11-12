@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS public.audit_log (
     description TEXT,
     proposed_fix TEXT,
     auto_fixable BOOLEAN DEFAULT FALSE,
-    status TEXT NOT NULL DEFAULT 'pending_approval',
+    status TEXT NOT NULL DEFAULT 'detected',
     approved_by TEXT,
     outcome TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -115,6 +115,18 @@ CREATE TABLE IF NOT EXISTS public.pipelines (
     status TEXT NOT NULL DEFAULT 'healthy',
     schedule TEXT,
     next_run TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS public.notification_settings (
+    id SMALLINT PRIMARY KEY,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE
+);
+INSERT INTO public.notification_settings(id,enabled) VALUES(1,TRUE)
+ON CONFLICT(id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.weekly_report_deliveries (
+    week_start TIMESTAMPTZ PRIMARY KEY,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS public.orchestrator_state (

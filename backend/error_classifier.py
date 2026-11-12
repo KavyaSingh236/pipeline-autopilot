@@ -1,4 +1,4 @@
-"""Failure playbook. Critical types always need a human; the rest are auto-healed by Agent 2."""
+"""Failure playbook. Critical source failures are autonomously contained; routine fixes are allowlisted."""
 from __future__ import annotations
 import structlog
 
@@ -18,7 +18,7 @@ ERROR_PLAYBOOK = {
     "invalid_range": {"description": "Values outside physically valid ranges",
                       "proposed_fix": "Quarantine out-of-range rows, load the rest", "auto_fixable": True},
     "row_count_anomaly": {"description": "Row count dropped >50% vs last good batch",
-                          "proposed_fix": "Reload from last known-good batch snapshot", "auto_fixable": False},
+                          "proposed_fix": "Reload from last known-good batch snapshot", "auto_fixable": True},
 }
 
 
@@ -26,6 +26,6 @@ def classify_error(error_type: str) -> dict:
     entry = ERROR_PLAYBOOK.get(error_type)
     if entry is None:
         log.warning("unknown_error_type", error_type=error_type)
-        return {"error_type": error_type, "description": "Unclassified failure — manual investigation required",
-                "proposed_fix": "Escalate to on-call data engineer", "auto_fixable": False}
+        return {"error_type": error_type, "description": "Unclassified failure — isolate and record",
+                "proposed_fix": "Quarantine unknown batch and preserve validated snapshot", "auto_fixable": True}
     return {"error_type": error_type, **entry}

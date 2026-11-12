@@ -3,6 +3,8 @@ import { useSearchParams } from "react-router-dom";
 import { fmtTime } from "@/components/status";
 
 const OUTCOME_COLOR = {
+  contained: "#FFCC00",
+  quarantined: "#FF0055",
   approved: "#00FF66",
   auto_fixed: "#00E5FF",
   manually_fixed: "#B388FF",
@@ -32,7 +34,7 @@ export default function AuditLog({ rows }) {
       <table className="w-full border-collapse text-left">
         <thead>
           <tr className="text-[9px] tracking-[0.2em] uppercase text-white/40">
-            {["Timestamp", "Pipeline", "Error", "Fix Applied", "Approved By", "Outcome"].map((h) => (
+            {["Timestamp", "Pipeline", "Error", "Fix Applied", "Recovery Mode", "Outcome"].map((h) => (
               <th key={h} className="px-4 py-3 border-b border-white/10 font-normal whitespace-nowrap">{h}</th>
             ))}
           </tr>
@@ -71,7 +73,7 @@ function ReactRow({r,expanded,toggle}) {
                 )}
               </td>
               <td className="px-4 py-3 border-b border-white/5 font-mono text-xs text-white/70 whitespace-nowrap">
-                {r.approved_by || "—"}
+                {r.approved_by || "Autonomous"}
               </td>
               <td className="px-4 py-3 border-b border-white/5 whitespace-nowrap">
                 <span
@@ -88,7 +90,7 @@ function ReactRow({r,expanded,toggle}) {
             </tr>
             {expanded && <tr><td colSpan={6} className="px-6 py-5 bg-[#10151B] border-b border-[#00E5FF]/30">
               <div className="grid md:grid-cols-2 gap-5 text-xs font-mono break-words">
-                {[["Error detected", r.description], ["Root cause", r.root_cause], ["Diagnosis source", r.model || "Not recorded"], ["Recommended fix", r.proposed_fix], ["Executed action", r.action], ["Result / human decision", r.outcome], ["Operator", r.approved_by], ["Validation evidence / error log", r.error_log], ["Downstream impact", r.downstream_impact], ["Risk if approved", r.risk_if_approved], ["Risk if rejected", r.risk_if_rejected], ["Affected rows", r.rows_affected]].filter(([,v]) => v !== null && v !== undefined && v !== "").map(([label,value]) => (
+                {[["Error detected", r.description], ["Root cause", r.root_cause], ["Diagnosis source", r.model || "Not recorded"], ["Recommended fix", r.proposed_fix], ["Executed action", r.action], ["Recovery outcome", r.outcome], ["Validation evidence / error log", r.error_log], ["Downstream impact", r.downstream_impact], ["Historical approval risk", r.risk_if_approved], ["Historical rejection risk", r.risk_if_rejected], ["Affected rows", r.rows_affected]].filter(([,v]) => v !== null && v !== undefined && v !== "").map(([label,value]) => (
                   <div key={label}><div className="uppercase tracking-widest text-[10px] text-[#00E5FF]/70 mb-2">{label}</div><div className="text-white/75 whitespace-pre-wrap">{String(value)}</div></div>
                 ))}
               </div>

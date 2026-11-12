@@ -3,12 +3,15 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+import json
 from pathlib import Path
+import secrets
+import mailer
 
 import structlog
 from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Header, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 
@@ -50,24 +53,6 @@ app = FastAPI(
 )
 
 api = APIRouter(prefix="/api")
-
-
-class ApprovalRequest(BaseModel):
-    audit_id: str
-    approved_by: str = "operator"
-
-
-class RejectRequest(BaseModel):
-    audit_id: str
-    rejected_by: str = "operator"
-    reason: str = ""
-
-
-class ManualFixRequest(BaseModel):
-    audit_id: str
-    fixed_by: str = "operator"
-    action: str | None = None
-    instruction: str | None = None
 
 
 class AlertToggle(BaseModel):
@@ -161,7 +146,8 @@ async def list_pipelines():
                 SELECT count(*)
                 FROM public.audit_log
                 WHERE pipeline_id=$1
-                  AND status IN ('pending_approval','rejected')
+                  AND status IN ('quarantined','contained')
+                  AND created_at > NOW() - interval '24 hours'
                 """,
                 pipeline["id"],
             )
@@ -169,7 +155,8 @@ async def list_pipelines():
             item = dict(pipeline)
             item["last_run"] = _row(last)
             item["total_runs"] = total_runs
-            item["needs_approval"] = bool(needs_approval)
+            item["needs_approval"] = False
+            item["has_containment"] = bool(needs_approval)
 
             result.append(item)
 
@@ -219,70 +206,13 @@ async def get_failures(pipeline_id: str):
             SELECT *
             FROM public.audit_log
             WHERE pipeline_id=$1
-              AND status IN ('pending_approval','rejected')
+              AND status IN ('quarantined','contained')
             ORDER BY created_at DESC
             """,
             pipeline_id,
         )
 
         return [dict(row) for row in rows]
-
-
-@api.post("/pipelines/{pipeline_id}/approve")
-async def approve(
-    pipeline_id: str,
-    request: ApprovalRequest,
-):
-    try:
-        return await orchestrator.approve_fix(
-            pipeline_id,
-            request.audit_id,
-            request.approved_by,
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        )
-
-
-@api.post("/pipelines/{pipeline_id}/reject")
-async def reject(
-    pipeline_id: str,
-    request: RejectRequest,
-):
-    try:
-        return await orchestrator.reject_fix(
-            pipeline_id,
-            request.audit_id,
-            request.rejected_by,
-            request.reason,
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        )
-
-
-@api.post("/pipelines/{pipeline_id}/manual-fix")
-async def manual_fix(
-    pipeline_id: str,
-    request: ManualFixRequest,
-):
-    try:
-        return await orchestrator.manual_fix(
-            pipeline_id,
-            request.audit_id,
-            request.fixed_by,
-            request.action,
-            request.instruction,
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        )
 
 
 @api.get("/audit")
@@ -461,18 +391,64 @@ async def demo_trigger(
 
 @api.get("/alerts/status")
 async def get_alert_status():
-    return {
-        "enabled": orchestrator.get_alerts_enabled(),
-    }
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        enabled = await conn.fetchval("SELECT enabled FROM public.notification_settings WHERE id=1")
+    return {"enabled": bool(enabled), "frequency": "weekly"}
 
 
 @api.post("/alerts/toggle")
 async def toggle_alerts(body: AlertToggle):
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE public.notification_settings SET enabled=$1 WHERE id=1", body.enabled)
     orchestrator.set_alerts_enabled(body.enabled)
+    return {"enabled": body.enabled, "frequency": "weekly"}
 
-    return {
-        "enabled": body.enabled,
-    }
+
+@api.post("/reports/weekly/send")
+async def send_weekly_report(x_report_token: str = Header("")):
+    """Invoked by a scheduled GitHub Action; never needs a human response."""
+    secret = os.getenv("WEEKLY_REPORT_TOKEN", "")
+    if not secret or not secrets.compare_digest(x_report_token, secret):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    pool = await db.get_pool()
+    now = datetime.now(timezone.utc)
+    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = week_start
+    start = end - timedelta(days=7)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(2316001)")
+            enabled = await conn.fetchval("SELECT enabled FROM public.notification_settings WHERE id=1")
+            if not enabled:
+                return {"status": "disabled"}
+            exists = await conn.fetchval("SELECT 1 FROM public.weekly_report_deliveries WHERE week_start=$1", start)
+            if exists:
+                return {"status": "already_sent", "week_start": start.isoformat()}
+            stats = await conn.fetch("""SELECT error_type,status,count(*) AS total
+                FROM public.audit_log WHERE created_at >= $1 AND created_at < $2
+                GROUP BY error_type,status ORDER BY total DESC""", start, end)
+            payload = [dict(r) for r in stats]
+            # Send while holding a lock to avoid concurrent duplicates. A provider
+            # timeout after accepting a message can still cause a retry duplicate.
+            # The LLM summarizes aggregate counts only; database numbers remain authoritative.
+            summary = ""
+            if orchestrator._client is not None:
+                result = await agents._chat(
+                    orchestrator._client,
+                    "Summarize ETL recovery counts in two short factual sentences. "
+                    "Do not invent incidents, claim missing records were restored, "
+                    "or ask for human action. Return JSON with a summary field.",
+                    json.dumps(payload),
+                    model=os.getenv("REMEDIATION_GROQ_MODEL", "openai/gpt-oss-120b"),
+                )
+                if isinstance(result, dict):
+                    summary = str(result.get("summary", ""))[:700]
+            mailer.send_weekly_report(start, end, payload, summary)
+            await conn.execute("""INSERT INTO public.weekly_report_deliveries(week_start,sent_at)
+                VALUES($1,NOW())""", start)
+    return {"status": "sent", "week_start": start.isoformat()}
 
 
 @app.websocket("/api/ws/pipelines")

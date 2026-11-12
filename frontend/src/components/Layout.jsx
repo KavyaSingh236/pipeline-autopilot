@@ -77,7 +77,7 @@ export default function Layout({ children, connected }) {
             <button
               onClick={handleToggle}
               disabled={toggling}
-              title={alertsOn ? "Email alerts ON — click to turn off" : "Email alerts OFF — click to turn on"}
+              title={alertsOn ? "Weekly report ON — click to turn off" : "Weekly report OFF — click to turn on"}
               className={`inline-flex items-center gap-2 px-3 py-2 text-[10px] tracking-[0.2em] uppercase border transition-colors ${
                 alertsOn
                   ? "border-[#00FF66] text-[#00FF66] bg-[#00FF66]/10"
@@ -85,7 +85,7 @@ export default function Layout({ children, connected }) {
               }`}
             >
               {alertsOn ? <Bell size={13} /> : <BellOff size={13} />}
-              {alertsOn ? "Alerts On" : "Alerts Off"}
+              {alertsOn ? "Weekly On" : "Weekly Off"}
             </button>
 
             <div className="flex items-center gap-2" data-testid="ws-status">

@@ -1,0 +1,18 @@
+name: Weekly autonomous recovery report
+on:
+  schedule:
+    - cron: '15 14 * * 1' # Mondays 14:15 UTC; reports previous full UTC week
+  workflow_dispatch:
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request last week's report
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          WEEKLY_REPORT_TOKEN: ${{ secrets.WEEKLY_REPORT_TOKEN }}
+        run: |
+          test -n "$BACKEND_URL" && test -n "$WEEKLY_REPORT_TOKEN"
+          curl --fail-with-body --retry 3 --retry-delay 15 --max-time 120 \
+            -X POST -H "X-Report-Token: $WEEKLY_REPORT_TOKEN" \
+            "${BACKEND_URL%/}/api/reports/weekly/send"

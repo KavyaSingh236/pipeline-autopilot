@@ -301,10 +301,11 @@ async def remediation_agent(
             "You are Agent 3, the Remediation Planner. Use the diagnosis and ETL evidence from "
             "the error log and validator evidence. Choose one action from the "
             "available automatic actions. The system will enforce a hard playbook "
-            "guardrail before executing it. For a critical row_count_anomaly, "
-            "recommend whether the operator should approve or reject the proposed "
-            "recovery. Also provide downstream impact, risk if approved, risk if "
-            "rejected, and exactly three ranked human alternatives. Return JSON."
+            "guardrail before executing it. No human approval is used. "
+            "For a critical row_count_anomaly, isolate the incomplete batch and "
+            "recommend restoring the last validated snapshot, without claiming "
+            "the missing source records were recovered. Explain downstream impact, "
+            "risk, and revalidation evidence. Return JSON."
         ),
         (
             f"Error type: {error_type}\n"
@@ -324,7 +325,7 @@ async def remediation_agent(
             "risk": "high" if not playbook["auto_fixable"] else "low",
             "confidence": 0.7,
             "model": "rule-based-fallback",
-            "recommendation": "approve",
+            "recommendation": "autonomous_recovery",
             "downstream_impact": (
                 "Trending-term dashboards and regional leader outputs may remain "
                 "stale or incomplete until the incident is resolved."
@@ -355,11 +356,7 @@ async def remediation_agent(
 
     confidence = max(0.0, min(1.0, confidence))
 
-    recommendation = (
-        "reject"
-        if str(out.get("recommendation", "")).lower() == "reject"
-        else "approve"
-    )
+    recommendation = "autonomous_recovery"
 
     return {
         "root_cause": str(out.get("root_cause", ""))[:500] or playbook["description"],

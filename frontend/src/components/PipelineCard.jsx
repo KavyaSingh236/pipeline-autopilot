@@ -9,7 +9,7 @@ export default function PipelineCard({ pipeline, index }) {
   const Icon = ICONS[pipeline.dag_id] || Layers;
   const s = statusOf(pipeline.status);
   const last = pipeline.last_run;
-  const needsApproval = pipeline.needs_approval;
+  const needsApproval = pipeline.has_containment;
 
   return (
     <motion.div

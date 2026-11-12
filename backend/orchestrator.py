@@ -139,13 +139,8 @@ async def _save_good(conn, pipeline_id: str, rows: list[dict[str, Any]]) -> None
 
 
 async def _has_open_failure(conn, pipeline_id: str) -> bool:
-    row = await conn.fetchrow(
-        """SELECT 1 FROM public.audit_log
-           WHERE pipeline_id=$1 AND status IN ('pending_approval','rejected','detected')
-           LIMIT 1""",
-        pipeline_id,
-    )
-    return bool(row)
+    # Historical approval incidents must not block autonomous processing.
+    return False
 
 
 async def _insert_audit(
@@ -193,7 +188,7 @@ async def _update_audit(conn, audit_id: str, status: str, action: str, explanati
     await conn.execute(
         """UPDATE public.audit_log SET status=$1,action=$2,explanation=$3,
            outcome=$3,resolved_at=CASE WHEN $1 IN
-           ('approved','manually_fixed','auto_fixed') THEN NOW() ELSE resolved_at END
+           ('approved','manually_fixed','auto_fixed','contained','quarantined') THEN NOW() ELSE resolved_at END
            WHERE id=$4::text::uuid""",
         status, action, explanation, audit_id,
     )
@@ -241,10 +236,6 @@ async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = 
     pipeline = _pipeline(pipeline_id)
     pool = await get_pool()
     async with pool.acquire() as conn:
-        if await _has_open_failure(conn, pipeline_id):
-            return {"pipeline_id": pipeline_id, "status": "pending_approval",
-                    "message": "This pipeline has an unresolved incident."}
-
         rows = await _get_batch()
         _rows_in_batch = len(rows)
         if not rows:
@@ -271,14 +262,6 @@ async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = 
         else:
             failure_number = await _next_failure_number(conn) if count_cycle else 1
             severity = "critical" if failure_number == 8 else "routine"
-            # One pending critical incident system-wide. Keep other pipelines
-            # processing routine errors instead of filling all three queues.
-            if severity == "critical":
-                open_critical = await conn.fetchval("""SELECT 1 FROM public.audit_log
-                    WHERE status IN ('pending_approval','rejected') LIMIT 1""")
-                if open_critical:
-                    severity = "routine"
-                    failure_number = 1
             error_type = None
 
         plan = await agents.generate_failure(
@@ -322,52 +305,57 @@ async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = 
             rows_affected = sum(1 for f in findings if f.get("type") == error_type)
         audit_id = await _insert_audit(
             conn, pipeline_id, error_type,
-            "pending_approval" if critical else "detected",
+            "detected",
             findings, diagnosis, error_log, rows_affected,
         )
 
+        # Agent 3 supplies the diagnosis and proposed action; only a fixed allowlist
+        # can execute. Critical source-volume loss must never publish a partial batch.
         if critical:
-            await _record_run(conn, pipeline_id, "failed", len(bad_rows), 0)
+            previous = await _load_good(conn, pipeline_id)
+            if previous:
+                await ds.load(conn, previous)
+                await _update_audit(
+                    conn, audit_id, "contained", "reload_last_good_batch",
+                    "Autonomously isolated the incomplete incoming batch and restored "
+                    "the last validated snapshot. Source freshness may be reduced; "
+                    "no partial source data was published.",
+                )
+                await _record_run(conn, pipeline_id, "success", len(previous), len(bad_rows))
+                await _set_status(conn, pipeline_id, "warning")
+                await _broadcast("autonomous_containment", {
+                    "pipeline_id": pipeline_id, "audit_id": audit_id,
+                    "status": "contained", "action": "reload_last_good_batch",
+                })
+                return {"pipeline_id": pipeline_id, "audit_id": audit_id,
+                        "status": "contained", "error_type": error_type,
+                        "rows_processed": len(previous), "rows_quarantined": len(bad_rows)}
+            await _update_audit(conn, audit_id, "quarantined", "quarantine_batch",
+                                "No validated snapshot exists; unsafe batch isolated without publishing.")
+            await _record_run(conn, pipeline_id, "failed", 0, len(bad_rows))
             await _set_status(conn, pipeline_id, "critical")
-            _held[audit_id] = [dict(r) for r in bad_rows]
-            await _broadcast("critical_failure", {
+            await _broadcast("autonomous_containment", {
                 "pipeline_id": pipeline_id, "audit_id": audit_id,
-                "error_type": error_type, "status": "pending_approval",
-                "recommendation": diagnosis.get("recommendation"),
-                "downstream_impact": diagnosis.get("downstream_impact"),
-                "risk_if_approved": diagnosis.get("risk_if_approved"),
-                "risk_if_rejected": diagnosis.get("risk_if_rejected"),
-                "alternatives": diagnosis.get("alternatives", []),
+                "status": "quarantined", "action": "quarantine_batch",
             })
-            if _alerts_enabled and mailer is not None:
-                try:
-                    await asyncio.to_thread(
-                        mailer.send_alert,
-                        pipeline["name"], pipeline_id, audit_id, error_type,
-                        "; ".join(str(f.get("detail", "")) for f in findings),
-                        diagnosis.get("root_cause", ""),
-                        diagnosis.get("action", ""),
-                        diagnosis.get("explanation", ""),
-                        diagnosis.get("downstream_impact", ""),
-                        diagnosis.get("risk_if_approved", ""),
-                        diagnosis.get("risk_if_rejected", ""),
-                    )
-                except Exception as exc:
-                    log.warning("critical_email_failed", error=str(exc))
             return {"pipeline_id": pipeline_id, "audit_id": audit_id,
-                    "status": "pending_approval", "error_type": error_type}
+                    "status": "quarantined", "error_type": error_type}
 
         action = ds.ALLOWED_ACTION[error_type]
         fixed, quarantined = ds.apply_fix(action, bad_rows, good)
         remaining = ds.validate(fixed, len(good))
         if remaining:
             log.error("auto_fix_validation_failed", pipeline_id=pipeline_id, findings=remaining)
-            await _update_audit(conn, audit_id, "pending_approval", action,
-                                "Automatic fix did not pass revalidation; human review required.")
+            await _update_audit(conn, audit_id, "quarantined", "quarantine_batch",
+                                "Automatic fix failed revalidation; unsafe batch isolated.")
             await _record_run(conn, pipeline_id, "failed", len(bad_rows), quarantined)
             await _set_status(conn, pipeline_id, "critical")
+            await _broadcast("autonomous_containment", {
+                "pipeline_id": pipeline_id, "audit_id": audit_id,
+                "status": "quarantined", "action": "quarantine_batch",
+            })
             return {"pipeline_id": pipeline_id, "audit_id": audit_id,
-                    "status": "pending_approval", "error_type": error_type}
+                    "status": "quarantined", "error_type": error_type}
         await ds.load(conn, fixed)
         await _save_good(conn, pipeline_id, fixed)
         await _update_audit(
@@ -399,13 +387,8 @@ async def run_pipeline_once(pipeline_id: str) -> dict[str, Any]:
 
 
 async def _sync_state_on_boot() -> None:
-    """After a restart, rebuild pipeline status from the persisted audit log (nothing starts from zero)."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """UPDATE public.pipelines p SET status='critical' WHERE EXISTS (
-               SELECT 1 FROM public.audit_log a WHERE a.pipeline_id=p.id
-               AND a.status IN ('pending_approval','rejected'))""")
+    """Legacy approval records are historical; they no longer block the scheduler."""
+    return None
 
 
 async def scheduler_loop() -> None:
@@ -464,7 +447,7 @@ def diagnostics() -> dict[str, Any]:
         "last_error": _last_error,
         "bigquery_ok": _bigquery_ok,
         "rows_in_batch": _rows_in_batch,
-        "held_critical_events": len(_held),
+        "held_critical_events": 0,
         "failure_cycle": "7 routine incidents, 1 critical incident per 8 injected incidents",
         "scheduler_running": _task is not None and not _task.done(),
         "gemini": agents.MODEL_STATUS["gemini"],
@@ -478,95 +461,6 @@ def get_alerts_enabled() -> bool:
 def set_alerts_enabled(value: bool) -> None:
     global _alerts_enabled
     _alerts_enabled = bool(value)
-
-
-async def approve_fix(pipeline_id: str, audit_id: str, approved_by: str) -> dict[str, Any]:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM public.audit_log WHERE id=$1::text::uuid AND pipeline_id=$2",
-            audit_id, pipeline_id,
-        )
-        if not row:
-            raise ValueError("Audit record not found.")
-        if row["status"] != "pending_approval":
-            raise ValueError("This incident is no longer awaiting approval.")
-        good = await _load_good(conn, pipeline_id)
-        if not good:
-            raise RuntimeError("No last known-good batch is available.")
-        await ds.load(conn, good)
-        await _save_good(conn, pipeline_id, good)
-        await _update_audit(conn, audit_id, "approved", "reload_last_good_batch",
-                            f"Approved by {approved_by}; restored the last known-good batch.")
-        await _record_run(conn, pipeline_id, "success", len(good), 0)
-        await _set_status(conn, pipeline_id, "healthy")
-    _held.pop(audit_id, None)
-    await _broadcast("critical_resolved", {"pipeline_id": pipeline_id,
-                    "audit_id": audit_id, "status": "approved", "approved_by": approved_by})
-    return {"pipeline_id": pipeline_id, "audit_id": audit_id,
-            "status": "approved", "action": "reload_last_good_batch"}
-
-
-async def reject_fix(pipeline_id: str, audit_id: str, rejected_by: str,
-                     reason: str = "") -> dict[str, Any]:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM public.audit_log WHERE id=$1::text::uuid AND pipeline_id=$2",
-            audit_id, pipeline_id,
-        )
-        if not row:
-            raise ValueError("Audit record not found.")
-        if row["status"] != "pending_approval":
-            raise ValueError("This incident is no longer awaiting approval.")
-        await _update_audit(
-            conn, audit_id, "rejected", "manual_fix_required",
-            f"Recommendation rejected by {rejected_by}. {reason}".strip(),
-        )
-    await _broadcast("critical_rejected", {"pipeline_id": pipeline_id,
-                    "audit_id": audit_id, "status": "rejected", "rejected_by": rejected_by})
-    return {"pipeline_id": pipeline_id, "audit_id": audit_id,
-            "status": "rejected", "manual_fix_required": True}
-
-
-async def manual_fix(pipeline_id: str, audit_id: str, fixed_by: str,
-                     action: str | None, instruction: str | None) -> dict[str, Any]:
-    if not action and instruction:
-        action = await agents.interpret_instruction(_client, instruction)
-    if action not in ds.MANUAL_ACTIONS:
-        raise ValueError("Instruction could not be mapped to an allowed manual action.")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM public.audit_log WHERE id=$1::text::uuid AND pipeline_id=$2",
-            audit_id, pipeline_id,
-        )
-        if not row:
-            raise ValueError("Audit record not found.")
-        if row["status"] not in ("pending_approval", "rejected"):
-            raise ValueError("This incident is not available for manual remediation.")
-        if action in ("reload_last_good_batch", "skip_and_keep_previous"):
-            rows = await _load_good(conn, pipeline_id)
-            if not rows:
-                raise RuntimeError("No last known-good batch is available.")
-            await ds.load(conn, rows)
-            await _save_good(conn, pipeline_id, rows)
-        elif action == "accept_partial_batch":
-            rows = _held.get(audit_id, [])
-            if not rows:
-                raise RuntimeError("The affected batch is unavailable; choose reload last known-good batch.")
-            await ds.load(conn, rows)
-            await _save_good(conn, pipeline_id, rows)
-        await _update_audit(conn, audit_id, "manually_fixed", action,
-                            f"Manual remediation completed by {fixed_by} using {ds.MANUAL_ACTIONS[action]}.")
-        await _record_run(conn, pipeline_id, "success", len(rows) if action != "skip_and_keep_previous" else 0, 0)
-        await _set_status(conn, pipeline_id, "healthy")
-    _held.pop(audit_id, None)
-    await _broadcast("manual_fix_completed", {"pipeline_id": pipeline_id,
-                    "audit_id": audit_id, "status": "manually_fixed",
-                    "action": action, "fixed_by": fixed_by})
-    return {"pipeline_id": pipeline_id, "audit_id": audit_id,
-            "status": "manually_fixed", "action": action}
 
 
 async def trigger_demo(error_type: str = "row_count_anomaly") -> dict[str, Any]:

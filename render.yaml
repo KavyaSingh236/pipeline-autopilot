@@ -34,3 +34,7 @@ services:
         value: "1.0"
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: WEEKLY_REPORT_TOKEN
+        sync: false
+      - key: RESEND_FROM
+        sync: false
