@@ -11,8 +11,9 @@ const PIPELINES = [
 const STATUSES = [
   { id: "", label: "All Statuses" },
   { id: "auto_fixed", label: "Auto-fixed (AI)" },
-  { id: "contained", label: "Contained" },
-  { id: "quarantined", label: "Quarantined" },
+  { id: "recovery_failed", label: "Recovery Failed" },
+  { id: "contained", label: "Contained (historical)" },
+  { id: "quarantined", label: "Quarantined (historical)" },
 ];
 
 export default function AuditLogPage({ lastEvent }) {

@@ -3,6 +3,7 @@ import { useSearchParams } from "react-router-dom";
 import { fmtTime } from "@/components/status";
 
 const OUTCOME_COLOR = {
+  recovery_failed: "#FF0055",
   contained: "#FFCC00",
   quarantined: "#FF0055",
   approved: "#00FF66",

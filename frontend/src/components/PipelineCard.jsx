@@ -9,7 +9,6 @@ export default function PipelineCard({ pipeline, index }) {
   const Icon = ICONS[pipeline.dag_id] || Layers;
   const s = statusOf(pipeline.status);
   const last = pipeline.last_run;
-  const needsApproval = pipeline.has_containment;
 
   return (
     <motion.div
@@ -19,10 +18,7 @@ export default function PipelineCard({ pipeline, index }) {
     >
       <Link to={`/pipeline/${pipeline.id}`} data-testid={`pipeline-card-${pipeline.id}`}>
         <div
-          className={`group relative bg-[#0A0A0A] border p-6 h-full transition-[transform,border-color] duration-300 hover:-translate-y-0.5 ${
-            needsApproval ? "tracing-beam border-transparent" : "border-white/10 hover:border-white/30"
-          }`}
-          style={needsApproval ? { boxShadow: "0 0 40px rgba(255,0,85,0.12)" } : {}}
+          className="group relative bg-[#0A0A0A] border border-white/10 hover:border-white/30 p-6 h-full transition-[transform,border-color] duration-300 hover:-translate-y-0.5"
         >
           <div className="flex items-start justify-between">
             <div className="flex items-center gap-3">

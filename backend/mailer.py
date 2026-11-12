@@ -28,6 +28,7 @@ def send_weekly_report(start: datetime, end: datetime, stats: list[dict], ai_sum
     recovered = counts["auto_fixed"]
     contained = counts["contained"]
     quarantined = counts["quarantined"]
+    failed = counts["recovery_failed"]
     # Historical pending/approved records are counted, not rewritten.
     rows = "".join(
         f"<tr><td style='padding:8px'>{html.escape(str(k))}</td>"
@@ -40,10 +41,9 @@ def send_weekly_report(start: datetime, end: datetime, stats: list[dict], ai_sum
       <h2>Pipeline Autopilot · Weekly autonomous recovery</h2>
       <p>{start:%d %b %Y} to {end:%d %b %Y} (UTC)</p>
       <p><b>{total}</b> incidents · <b>{recovered}</b> auto-fixed ·
-         <b>{contained}</b> contained using validated snapshots ·
-         <b>{quarantined}</b> quarantined</p>
-      <p>Containment protects downstream data; it does not guarantee that missing
-         upstream records have been recovered.</p>
+         <b>{failed}</b> recovery failed ·
+         <b>{contained + quarantined}</b> historical protected incidents</p>
+      <p>Unsuccessful recovery does not imply that missing upstream records were restored.</p>
       <h3>Summary</h3><p>{html.escape(ai_summary) if ai_summary else "Automated recovery statistics for the past seven days."}</p>
       <h3>Most frequent issues</h3>
       <table style='border-collapse:collapse;color:#f5f5f5'>{rows}</table>

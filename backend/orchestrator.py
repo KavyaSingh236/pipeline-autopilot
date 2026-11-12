@@ -188,7 +188,7 @@ async def _update_audit(conn, audit_id: str, status: str, action: str, explanati
     await conn.execute(
         """UPDATE public.audit_log SET status=$1,action=$2,explanation=$3,
            outcome=$3,resolved_at=CASE WHEN $1 IN
-           ('approved','manually_fixed','auto_fixed','contained','quarantined') THEN NOW() ELSE resolved_at END
+           ('approved','manually_fixed','auto_fixed','contained','quarantined','recovery_failed') THEN NOW() ELSE resolved_at END
            WHERE id=$4::text::uuid""",
         status, action, explanation, audit_id,
     )
@@ -309,53 +309,53 @@ async def _inject_and_process(pipeline_id: str, forced_error_type: str | None = 
             findings, diagnosis, error_log, rows_affected,
         )
 
-        # Agent 3 supplies the diagnosis and proposed action; only a fixed allowlist
-        # can execute. Critical source-volume loss must never publish a partial batch.
+        # Agent 3 proposes the action. Enforce the existing allowlist before execution.
+        proposed_action = diagnosis.get("action")
+        permitted_action = ds.ALLOWED_ACTION[error_type]
+        action = proposed_action if proposed_action == permitted_action else permitted_action
+
+        # Missing source records cannot be reconstructed by a deduplication or cast.
+        # The last validated snapshot preserves availability but is NOT a successful
+        # repair of the missing incoming records.
         if critical:
             previous = await _load_good(conn, pipeline_id)
             if previous:
                 await ds.load(conn, previous)
-                await _update_audit(
-                    conn, audit_id, "contained", "reload_last_good_batch",
-                    "Autonomously isolated the incomplete incoming batch and restored "
-                    "the last validated snapshot. Source freshness may be reduced; "
-                    "no partial source data was published.",
+                explanation = (
+                    "Agent 3 restored the last validated snapshot. Incoming source records "
+                    "remain missing; recovery was not verified and freshness may be reduced."
                 )
-                await _record_run(conn, pipeline_id, "success", len(previous), len(bad_rows))
+                await _record_run(conn, pipeline_id, "failed", len(previous), len(bad_rows))
                 await _set_status(conn, pipeline_id, "warning")
-                await _broadcast("autonomous_containment", {
-                    "pipeline_id": pipeline_id, "audit_id": audit_id,
-                    "status": "contained", "action": "reload_last_good_batch",
-                })
-                return {"pipeline_id": pipeline_id, "audit_id": audit_id,
-                        "status": "contained", "error_type": error_type,
-                        "rows_processed": len(previous), "rows_quarantined": len(bad_rows)}
-            await _update_audit(conn, audit_id, "quarantined", "quarantine_batch",
-                                "No validated snapshot exists; unsafe batch isolated without publishing.")
-            await _record_run(conn, pipeline_id, "failed", 0, len(bad_rows))
-            await _set_status(conn, pipeline_id, "critical")
-            await _broadcast("autonomous_containment", {
+            else:
+                explanation = (
+                    "Agent 3 could not restore missing source records and no validated "
+                    "snapshot exists. Unsafe incoming data was not published."
+                )
+                await _record_run(conn, pipeline_id, "failed", 0, len(bad_rows))
+                await _set_status(conn, pipeline_id, "critical")
+            await _update_audit(conn, audit_id, "recovery_failed", action, explanation)
+            await _broadcast("recovery_failed", {
                 "pipeline_id": pipeline_id, "audit_id": audit_id,
-                "status": "quarantined", "action": "quarantine_batch",
+                "status": "recovery_failed", "action": action,
             })
             return {"pipeline_id": pipeline_id, "audit_id": audit_id,
-                    "status": "quarantined", "error_type": error_type}
+                    "status": "recovery_failed", "error_type": error_type}
 
-        action = ds.ALLOWED_ACTION[error_type]
         fixed, quarantined = ds.apply_fix(action, bad_rows, good)
         remaining = ds.validate(fixed, len(good))
         if remaining:
             log.error("auto_fix_validation_failed", pipeline_id=pipeline_id, findings=remaining)
-            await _update_audit(conn, audit_id, "quarantined", "quarantine_batch",
-                                "Automatic fix failed revalidation; unsafe batch isolated.")
+            await _update_audit(conn, audit_id, "recovery_failed", action,
+                                "Agent 3 attempted recovery but revalidation failed; unsafe batch was not published.")
             await _record_run(conn, pipeline_id, "failed", len(bad_rows), quarantined)
             await _set_status(conn, pipeline_id, "critical")
-            await _broadcast("autonomous_containment", {
+            await _broadcast("recovery_failed", {
                 "pipeline_id": pipeline_id, "audit_id": audit_id,
-                "status": "quarantined", "action": "quarantine_batch",
+                "status": "recovery_failed", "action": action,
             })
             return {"pipeline_id": pipeline_id, "audit_id": audit_id,
-                    "status": "quarantined", "error_type": error_type}
+                    "status": "recovery_failed", "error_type": error_type}
         await ds.load(conn, fixed)
         await _save_good(conn, pipeline_id, fixed)
         await _update_audit(

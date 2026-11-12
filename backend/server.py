@@ -141,22 +141,10 @@ async def list_pipelines():
                 pipeline["dag_id"],
             )
 
-            needs_approval = await conn.fetchval(
-                """
-                SELECT count(*)
-                FROM public.audit_log
-                WHERE pipeline_id=$1
-                  AND status IN ('quarantined','contained')
-                  AND created_at > NOW() - interval '24 hours'
-                """,
-                pipeline["id"],
-            )
-
             item = dict(pipeline)
             item["last_run"] = _row(last)
             item["total_runs"] = total_runs
             item["needs_approval"] = False
-            item["has_containment"] = bool(needs_approval)
 
             result.append(item)
 
@@ -206,7 +194,7 @@ async def get_failures(pipeline_id: str):
             SELECT *
             FROM public.audit_log
             WHERE pipeline_id=$1
-              AND status IN ('quarantined','contained')
+              AND status = 'recovery_failed'
             ORDER BY created_at DESC
             """,
             pipeline_id,
