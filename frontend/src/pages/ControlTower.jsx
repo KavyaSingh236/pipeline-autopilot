@@ -1,44 +1,544 @@
+
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import { Database, ShieldCheck, Zap, Clock3, Activity, CheckCircle2, TrendingUp, ArrowRight, GitBranch, ListChecks } from 'lucide-react';
-import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, Legend } from 'recharts';
+import {
+  Database, ShieldCheck, Zap, Clock3, Activity,
+  CheckCircle2, TrendingUp, ArrowRight, GitBranch, ListChecks
+} from 'lucide-react';
+import {
+  ResponsiveContainer, LineChart, Line, XAxis, YAxis,
+  Tooltip, CartesianGrid
+} from 'recharts';
 import { getPipelines, getAudit } from '@/lib/api';
 
 const safeNumber = v => Number.isFinite(Number(v)) ? Number(v) : 0;
 const nice = n => safeNumber(n).toLocaleString();
-const stages = [{match:'ingest',title:'Ingest',subtitle:'Google Trends · BigQuery',description:'Collects fresh search trends and loads them into the raw Bronze layer.',Icon:Database},{match:'transform',title:'Transform',subtitle:'Bronze → Silver → Gold',description:'Cleans and organizes records into analysis-ready data.',Icon:GitBranch},{match:'validate',title:'Validate',subtitle:'Data quality checks',description:'Checks missing values, duplicates and ranges before data is used.',Icon:ShieldCheck}];
 
-export default function ControlTower({lastEvent}) {
- const [pipelines,setPipelines]=useState([]),[audit,setAudit]=useState([]),[error,setError]=useState('');
- const [trendWindow,setTrendWindow]=useState('24h');
- const load=useCallback(async()=>{try{const [p,a]=await Promise.all([getPipelines(),getAudit({})]);setPipelines(Array.isArray(p)?p:[]);setAudit(Array.isArray(a)?a:[]);setError('');}catch(e){setError('Live metrics are temporarily unavailable.');}},[]);
- useEffect(()=>{load();const timer=setInterval(load,45000);return()=>clearInterval(timer)},[load]);
- useEffect(()=>{if(lastEvent)load()},[lastEvent,load]);
- const latest=pipelines.find(p=>String(p.dag_id||p.id).includes('ingest'))||pipelines[0];
- const last=latest?.last_run||{};
- const healthy=pipelines.filter(p=>p.status==='healthy').length;
- const resolved=audit.filter(a=>a.status==='auto_fixed');
+const stages = [
+  {
+    match: 'ingest',
+    title: 'Ingest',
+    subtitle: 'Google Trends · BigQuery',
+    description: 'Collects fresh search trends and loads them into the raw Bronze layer.',
+    Icon: Database
+  },
+  {
+    match: 'transform',
+    title: 'Transform',
+    subtitle: 'Bronze → Silver → Gold',
+    description: 'Cleans and organizes records into analysis-ready data.',
+    Icon: GitBranch
+  },
+  {
+    match: 'validate',
+    title: 'Validate',
+    subtitle: 'Data quality checks',
+    description: 'Checks missing values, duplicates and ranges before data is used.',
+    Icon: ShieldCheck
+  }
+];
 
- const chart=useMemo(()=>{
-   const now=Date.now();const hourly=trendWindow==='24h';const count=hourly?24:7;
-   const step=hourly?3600000:86400000;
-   const end=hourly?Math.floor(now/step)*step:Math.floor(now/step)*step;
-   const buckets=Array.from({length:count},(_,i)=>{const start=end-(count-1-i)*step;return {start, date:hourly?new Date(start).toLocaleTimeString([],{hour:'numeric',hour12:true}):new Date(start).toLocaleDateString([],{month:'short',day:'numeric'}),incidents:0,recovered:0};});
-   audit.forEach(a=>{if(!a.created_at||!['auto_fixed','recovery_failed'].includes(a.status))return;const timestamp=new Date(a.created_at).getTime();if(!Number.isFinite(timestamp))return;const index=Math.floor((timestamp-buckets[0].start)/step);if(index>=0&&index<count){buckets[index].incidents++;if(a.status==='auto_fixed')buckets[index].recovered++;}});
-   return hourly?buckets.filter((_,i)=>i%3===0||buckets[i].incidents>0||i===count-1):buckets;
- },[audit,trendWindow]);
- const processed=safeNumber(last.rows_processed),quarantined=safeNumber(last.rows_quarantined);
- const quality=processed+quarantined>0?Math.round(100*processed/(processed+quarantined)):null;
- const cards=[{label:'Rows Processed',value:latest?nice(processed):'—',note:'Latest ingest run',Icon:Database,kind:'blue'},{label:'Data Quality',value:quality===null?'—':`${quality}%`,note:'Latest ingest batch · usable share',Icon:ShieldCheck,kind:'mint'},{label:'Auto-Recoveries',value:nice(resolved.length),note:'Recent audit records',Icon:Zap,kind:'purple'},{label:'Pipeline Health',value:`${healthy}/${pipelines.length}`,note:'Healthy monitored stages',Icon:Clock3,kind:'peach'}];
- return <div className="pa-dashboard">
-  <div className="pa-heading"><div><span className="pa-eyebrow">MISSION CONTROL</span><h1>Pipeline overview <span>✦</span></h1><p>See how your data is flowing, recovering, and performing—all in one place.</p></div><span className="pa-timestamp">Updated {new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}</span></div>
-  {error&&<div className="pa-warning">{error}</div>}
-  <div className="pa-kpis">{cards.map(({label,value,note,Icon,kind})=><div className={'pa-kpi '+kind} key={label}><div className="pa-kpi-icon"><Icon size={27}/></div><div><span>{label}</span><strong>{value}</strong><small>{note}</small></div></div>)}</div>
-  <div className="pa-dashboard-grid">
-   <section className="pa-panel pa-health pa-health-clickable" role="region" aria-label="Pipeline Health"><div className="pa-panel-heading"><h2><Activity size={21}/> Pipeline Health</h2><Link className="pa-explore-link" to="/data-flow">Explore data flow <ArrowRight size={15}/></Link><span className={'pa-health-pill '+(healthy===pipelines.length&&pipelines.length?'ok':'attention')}>{healthy===pipelines.length&&pipelines.length?'✓ All stages healthy':'Monitoring stages'}</span></div><div className="pa-stages">{stages.map(({match,title,subtitle,description,Icon},i)=>{const p=pipelines.find(x=>String(x.dag_id||x.id).includes(match));return <div className="pa-stage-wrap" key={title}><div className={'pa-stage stage-'+match}><div className="pa-stage-icon"><Icon size={30}/></div><strong>{title}</strong><small>{subtitle}</small><span className={p?.status==='healthy'?'pa-stage-good':'pa-stage-bad'}>{p?(p.status==='healthy'?'✓ Healthy':p.status):'No data'}</span><p className="pa-stage-description">{description}</p></div>{i<2&&<span className="pa-stage-arrow">➜</span>}</div>})}</div><p className="pa-muted pa-stage-foot">Click “Explore data flow” to follow records through Bronze, Silver and Gold. Full incident evidence stays in Audit Log.</p></section>
-   <section className="pa-panel pa-summary"><div className="pa-panel-heading"><h2><ListChecks size={21}/> Run Summary</h2><span className="pa-muted">All recorded runs</span></div><div className="pa-summary-grid"><div><CheckCircle2 size={22}/><small>Recorded Runs</small><strong>{nice(pipelines.reduce((n,p)=>n+safeNumber(p.total_runs),0))}</strong></div><div><ShieldCheck size={22}/><small>Healthy Stages</small><strong>{healthy}/{pipelines.length}</strong></div><div><Zap size={22}/><small>Auto-Recoveries*</small><strong>{nice(resolved.length)}</strong></div><div><Database size={22}/><small>Latest Usable Rows</small><strong>{latest?nice(processed):'—'}</strong></div></div><p className="pa-muted pa-summary-foot">*Based on the latest {audit.length} audit entries; historical failures may already be resolved.</p></section>
-   <section className="pa-panel pa-trend"><div className="pa-panel-heading"><h2><TrendingUp size={21}/> Recovery Activity {trendWindow==='24h'?'by Hour':'by Day'}</h2><div className="pa-trend-switch" role="group" aria-label="Recovery trend time range"><button type="button" className={trendWindow==='24h'?'active':''} onClick={()=>setTrendWindow('24h')}>24 hours</button><button type="button" className={trendWindow==='7d'?'active':''} onClick={()=>setTrendWindow('7d')}>7 days</button></div></div><div className="pa-chart"><ResponsiveContainer width="100%" height="100%"><LineChart data={chart} margin={{top:12,right:12,left:-24,bottom:0}} barGap={3}><CartesianGrid stroke="#eae7f5" strokeDasharray="4 4" vertical={false}/><XAxis dataKey="date" interval="preserveStartEnd" tick={{fontSize:10,fill:'#77758c'}} axisLine={false} tickLine={false}/><YAxis allowDecimals={false} tick={{fontSize:11,fill:'#77758c'}} axisLine={false} tickLine={false}/><Tooltip contentStyle={{borderRadius:14,border:'1px solid #ded5ff',boxShadow:'0 10px 30px #42328b22'}}/><Legend/><Line type="monotone" name="Auto-recovered" dataKey="recovered" stroke="#13b89b" strokeWidth={3.5} dot={{r:3.5,fill:"#13b89b"}} activeDot={{r:6}} animationDuration={1050}/><Line type="monotone" name="Detected incidents" dataKey="incidents" stroke="#7c4df2" strokeDasharray="2 10" strokeWidth={5} dot={{r:5,fill:"#fff",stroke:"#7c4df2",strokeWidth:2.5}} activeDot={{r:7,fill:"#fff",stroke:"#7c4df2",strokeWidth:3}} animationDuration={850}/></LineChart></ResponsiveContainer></div><p className="pa-muted pa-summary-foot">Live recorded incidents, grouped by {trendWindow==='24h'?'local hour':'date'}. Counts are limited to the audit records returned by the API; zero points may mean no records in the sample.</p></section>
-   <section className="pa-panel pa-activity"><div className="pa-panel-heading"><h2><Zap size={21}/> Recent Activity</h2><Link to="/audit">View details <ArrowRight size={15}/></Link></div><div className="pa-activity-list">{audit.slice(0,4).map(r=><div className="pa-activity-row" key={r.id}><span className={'pa-activity-mark '+(r.status==='auto_fixed'?'good':'warn')}>{r.status==='auto_fixed'?'✓':'!'}</span><div><strong>{(r.error_type||'Pipeline event').replaceAll('_',' ')}</strong><small>{r.status==='auto_fixed'?'Automatically recovered':r.status==='recovery_failed'?'Recovery could not be verified':(r.status||'Recorded').replaceAll('_',' ')} · {r.created_at?new Date(r.created_at).toLocaleString():''}</small></div></div>)}{!audit.length&&<div className="pa-empty">No recorded incidents yet.</div>}</div></section>
-  </div>
- </div>
+export default function ControlTower({ lastEvent }) {
+  const [pipelines, setPipelines] = useState([]);
+  const [audit, setAudit] = useState([]);
+  const [error, setError] = useState('');
+  const [trendWindow, setTrendWindow] = useState('24h');
+
+  const load = useCallback(async () => {
+    try {
+      const [p, a] = await Promise.all([
+        getPipelines(),
+        getAudit({})
+      ]);
+      setPipelines(Array.isArray(p) ? p : []);
+      setAudit(Array.isArray(a) ? a : []);
+      setError('');
+    } catch (e) {
+      setError('Live metrics are temporarily unavailable.');
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    const timer = setInterval(load, 45000);
+    return () => clearInterval(timer);
+  }, [load]);
+
+  useEffect(() => {
+    if (lastEvent) load();
+  }, [lastEvent, load]);
+
+  const latest =
+    pipelines.find(p =>
+      String(p.dag_id || p.id).includes('ingest')
+    ) || pipelines[0];
+
+  const last = latest?.last_run || {};
+  const healthy = pipelines.filter(p => p.status === 'healthy').length;
+  const resolved = audit.filter(a => a.status === 'auto_fixed');
+
+  const chart = useMemo(() => {
+    const now = Date.now();
+    const hourly = trendWindow === '24h';
+    const count = hourly ? 24 : 7;
+    const step = hourly ? 3600000 : 86400000;
+    const end = Math.floor(now / step) * step;
+
+    const buckets = Array.from({ length: count }, (_, i) => {
+      const start = end - (count - 1 - i) * step;
+
+      return {
+        start,
+        date: hourly
+          ? new Date(start).toLocaleTimeString([], {
+              hour: 'numeric',
+              hour12: true
+            })
+          : new Date(start).toLocaleDateString([], {
+              month: 'short',
+              day: 'numeric'
+            }),
+        incidents: 0,
+        recovered: 0
+      };
+    });
+
+    audit.forEach(a => {
+      if (
+        !a.created_at ||
+        !['auto_fixed', 'recovery_failed'].includes(a.status)
+      ) return;
+
+      const timestamp = new Date(a.created_at).getTime();
+      if (!Number.isFinite(timestamp)) return;
+
+      const index = Math.floor(
+        (timestamp - buckets[0].start) / step
+      );
+
+      if (index >= 0 && index < count) {
+        buckets[index].incidents++;
+
+        if (a.status === 'auto_fixed') {
+          buckets[index].recovered++;
+        }
+      }
+    });
+
+    return hourly
+      ? buckets.filter(
+          (_, i) =>
+            i % 3 === 0 ||
+            buckets[i].incidents > 0 ||
+            i === count - 1
+        )
+      : buckets;
+  }, [audit, trendWindow]);
+
+  const processed = safeNumber(last.rows_processed);
+  const quarantined = safeNumber(last.rows_quarantined);
+
+  const quality =
+    processed + quarantined > 0
+      ? Math.round(100 * processed / (processed + quarantined))
+      : null;
+
+  const cards = [
+    {
+      label: 'Rows Processed',
+      value: latest ? nice(processed) : '—',
+      note: 'Latest ingest run',
+      Icon: Database,
+      kind: 'blue'
+    },
+    {
+      label: 'Data Quality',
+      value: quality === null ? '—' : `${quality}%`,
+      note: 'Latest ingest batch · usable share',
+      Icon: ShieldCheck,
+      kind: 'mint'
+    },
+    {
+      label: 'Auto-Recoveries',
+      value: nice(resolved.length),
+      note: 'Recent audit records',
+      Icon: Zap,
+      kind: 'purple'
+    },
+    {
+      label: 'Pipeline Health',
+      value: `${healthy}/${pipelines.length}`,
+      note: 'Healthy monitored stages',
+      Icon: Clock3,
+      kind: 'peach'
+    }
+  ];
+
+  const chartSeries = [
+    {
+      key: 'incidents',
+      label: 'Detected incidents',
+      color: '#7c4df2'
+    },
+    {
+      key: 'recovered',
+      label: 'Auto-recovered',
+      color: '#13b89b'
+    }
+  ];
+
+  return (
+    <div className="pa-dashboard">
+      <div className="pa-heading">
+        <div>
+          <span className="pa-eyebrow">MISSION CONTROL</span>
+          <h1>Pipeline overview <span>✦</span></h1>
+          <p>
+            See how your data is flowing, recovering, and
+            performing—all in one place.
+          </p>
+        </div>
+
+        <span className="pa-timestamp">
+          Updated {new Date().toLocaleTimeString([], {
+            hour: 'numeric',
+            minute: '2-digit'
+          })}
+        </span>
+      </div>
+
+      {error && <div className="pa-warning">{error}</div>}
+
+      <div className="pa-kpis">
+        {cards.map(({ label, value, note, Icon, kind }) => (
+          <div className={'pa-kpi ' + kind} key={label}>
+            <div className="pa-kpi-icon">
+              <Icon size={27} />
+            </div>
+            <div>
+              <span>{label}</span>
+              <strong>{value}</strong>
+              <small>{note}</small>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="pa-dashboard-grid">
+        <section
+          className="pa-panel pa-health pa-health-clickable"
+          role="region"
+          aria-label="Pipeline Health"
+        >
+          <div className="pa-panel-heading">
+            <h2>
+              <Activity size={21} /> Pipeline Health
+            </h2>
+
+            <Link className="pa-explore-link" to="/data-flow">
+              Explore data flow <ArrowRight size={15} />
+            </Link>
+
+            <span
+              className={
+                'pa-health-pill ' +
+                (healthy === pipelines.length && pipelines.length
+                  ? 'ok'
+                  : 'attention')
+              }
+            >
+              {healthy === pipelines.length && pipelines.length
+                ? '✓ All stages healthy'
+                : 'Monitoring stages'}
+            </span>
+          </div>
+
+          <div className="pa-stages">
+            {stages.map(
+              ({ match, title, subtitle, description, Icon }, i) => {
+                const p = pipelines.find(x =>
+                  String(x.dag_id || x.id).includes(match)
+                );
+
+                return (
+                  <div className="pa-stage-wrap" key={title}>
+                    <div className={'pa-stage stage-' + match}>
+                      <div className="pa-stage-icon">
+                        <Icon size={30} />
+                      </div>
+
+                      <strong>{title}</strong>
+                      <small>{subtitle}</small>
+
+                      <span
+                        className={
+                          p?.status === 'healthy'
+                            ? 'pa-stage-good'
+                            : 'pa-stage-bad'
+                        }
+                      >
+                        {p
+                          ? p.status === 'healthy'
+                            ? '✓ Healthy'
+                            : p.status
+                          : 'No data'}
+                      </span>
+
+                      <p className="pa-stage-description">
+                        {description}
+                      </p>
+                    </div>
+
+                    {i < 2 && (
+                      <span className="pa-stage-arrow">➜</span>
+                    )}
+                  </div>
+                );
+              }
+            )}
+          </div>
+
+          <p className="pa-muted pa-stage-foot">
+            Click “Explore data flow” to follow records through
+            Bronze, Silver and Gold. Full incident evidence stays
+            in Audit Log.
+          </p>
+        </section>
+
+        <section className="pa-panel pa-summary">
+          <div className="pa-panel-heading">
+            <h2>
+              <ListChecks size={21} /> Run Summary
+            </h2>
+            <span className="pa-muted">All recorded runs</span>
+          </div>
+
+          <div className="pa-summary-grid">
+            <div>
+              <CheckCircle2 size={22} />
+              <small>Recorded Runs</small>
+              <strong>
+                {nice(
+                  pipelines.reduce(
+                    (n, p) => n + safeNumber(p.total_runs),
+                    0
+                  )
+                )}
+              </strong>
+            </div>
+
+            <div>
+              <ShieldCheck size={22} />
+              <small>Healthy Stages</small>
+              <strong>{healthy}/{pipelines.length}</strong>
+            </div>
+
+            <div>
+              <Zap size={22} />
+              <small>Auto-Recoveries*</small>
+              <strong>{nice(resolved.length)}</strong>
+            </div>
+
+            <div>
+              <Database size={22} />
+              <small>Latest Usable Rows</small>
+              <strong>
+                {latest ? nice(processed) : '—'}
+              </strong>
+            </div>
+          </div>
+
+          <p className="pa-muted pa-summary-foot">
+            *Based on the latest {audit.length} audit entries;
+            historical failures may already be resolved.
+          </p>
+        </section>
+
+        <section className="pa-panel pa-trend">
+          <div className="pa-panel-heading">
+            <h2>
+              <TrendingUp size={21} />
+              Recovery Activity{' '}
+              {trendWindow === '24h' ? 'by Hour' : 'by Day'}
+            </h2>
+
+            <div
+              className="pa-trend-switch"
+              role="group"
+              aria-label="Recovery trend time range"
+            >
+              <button
+                type="button"
+                className={trendWindow === '24h' ? 'active' : ''}
+                onClick={() => setTrendWindow('24h')}
+              >
+                24 hours
+              </button>
+
+              <button
+                type="button"
+                className={trendWindow === '7d' ? 'active' : ''}
+                onClick={() => setTrendWindow('7d')}
+              >
+                7 days
+              </button>
+            </div>
+          </div>
+
+          {/* Separate charts prevent identical series overlapping. */}
+          <div
+            className="pa-chart"
+            style={{
+              height: 330,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 8
+            }}
+          >
+            {chartSeries.map((series, index) => (
+              <div
+                key={series.key}
+                style={{ height: 155, minHeight: 0 }}
+              >
+                <div
+                  style={{
+                    fontSize: 12,
+                    fontWeight: 700,
+                    color: series.color,
+                    marginLeft: 38,
+                    marginBottom: 2
+                  }}
+                >
+                  {series.label}
+                </div>
+
+                <ResponsiveContainer width="100%" height="88%">
+                  <LineChart
+                    data={chart}
+                    margin={{
+                      top: 8,
+                      right: 18,
+                      left: -22,
+                      bottom: index === 1 ? 0 : 2
+                    }}
+                  >
+                    <CartesianGrid
+                      stroke="#eae7f5"
+                      strokeDasharray="4 4"
+                      vertical={false}
+                    />
+
+                    <XAxis
+                      dataKey="date"
+                      hide={index === 0}
+                      interval="preserveStartEnd"
+                      tick={{
+                        fontSize: 10,
+                        fill: '#77758c'
+                      }}
+                      axisLine={false}
+                      tickLine={false}
+                    />
+
+                    <YAxis
+                      allowDecimals={false}
+                      tick={{
+                        fontSize: 10,
+                        fill: '#77758c'
+                      }}
+                      axisLine={false}
+                      tickLine={false}
+                    />
+
+                    <Tooltip
+                      contentStyle={{
+                        borderRadius: 12,
+                        border: '1px solid #ded5ff'
+                      }}
+                    />
+
+                    <Line
+                      type="monotone"
+                      name={series.label}
+                      dataKey={series.key}
+                      stroke={series.color}
+                      strokeWidth={3}
+                      dot={{
+                        r: 3,
+                        fill: series.color
+                      }}
+                      activeDot={{ r: 5 }}
+                      animationDuration={850}
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            ))}
+          </div>
+
+          <p className="pa-muted pa-summary-foot">
+            Live recorded incidents, grouped by{' '}
+            {trendWindow === '24h' ? 'local hour' : 'date'}.
+            Counts are limited to the audit records returned by
+            the API; zero points may mean no records in the sample.
+          </p>
+        </section>
+
+        <section className="pa-panel pa-activity">
+          <div className="pa-panel-heading">
+            <h2>
+              <Zap size={21} /> Recent Activity
+            </h2>
+
+            <Link to="/audit">
+              View details <ArrowRight size={15} />
+            </Link>
+          </div>
+
+          <div className="pa-activity-list">
+            {audit.slice(0, 4).map(r => (
+              <div className="pa-activity-row" key={r.id}>
+                <span
+                  className={
+                    'pa-activity-mark ' +
+                    (r.status === 'auto_fixed'
+                      ? 'good'
+                      : 'warn')
+                  }
+                >
+                  {r.status === 'auto_fixed' ? '✓' : '!'}
+                </span>
+
+                <div>
+                  <strong>
+                    {(r.error_type || 'Pipeline event')
+                      .replaceAll('_', ' ')}
+                  </strong>
+
+                  <small>
+                    {r.status === 'auto_fixed'
+                      ? 'Automatically recovered'
+                      : r.status === 'recovery_failed'
+                        ? 'Recovery could not be verified'
+                        : (r.status || 'Recorded')
+                            .replaceAll('_', ' ')}
+                    {' · '}
+                    {r.created_at
+                      ? new Date(r.created_at).toLocaleString()
+                      : ''}
+                  </small>
+                </div>
+              </div>
+            ))}
+
+            {!audit.length && (
+              <div className="pa-empty">
+                No recorded incidents yet.
+              </div>
+            )}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
 }
