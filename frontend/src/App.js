@@ -4,6 +4,7 @@ import { Toaster } from "sonner";
 import Layout from "@/components/Layout";
 import ControlTower from "@/pages/ControlTower";
 import Reports from "@/pages/Reports";
+import DataFlowExplorer from "@/pages/DataFlowExplorer";
 import AuditLogPage from "@/pages/AuditLogPage";
 import { useLiveStatus } from "@/lib/useLiveStatus";
 
@@ -17,6 +18,7 @@ function App() {
           <Routes>
             <Route path="/" element={<ControlTower lastEvent={lastEvent} />} />
             <Route path="/reports" element={<Reports />} />
+            <Route path="/data-flow" element={<DataFlowExplorer lastEvent={lastEvent} />} />
             <Route path="/audit" element={<AuditLogPage lastEvent={lastEvent} />} />
           </Routes>
         </Layout>

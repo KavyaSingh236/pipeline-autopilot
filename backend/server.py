@@ -366,6 +366,36 @@ async def get_lineage(pipeline_id: str):
     }
 
 
+@api.get("/data-flow/preview")
+async def get_data_flow_preview(layer: str = Query("bronze")):
+    """Small, read-only preview of public trend data. Table names are allowlisted."""
+    tables = {
+        "bronze": "bronze.raw_trends",
+        "silver": "silver.trends_clean",
+        "gold_terms": "gold.trending_terms",
+        "gold_regions": "gold.region_leaders",
+    }
+    if layer not in tables:
+        raise HTTPException(status_code=400, detail="Unknown data layer")
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        try:
+            rows = await conn.fetch(f"SELECT * FROM {tables[layer]} LIMIT 5")
+            count = await conn.fetchval(f"SELECT COUNT(*) FROM {tables[layer]}")
+        except Exception:
+            log.exception("flow_preview_unavailable", layer=layer)
+            raise HTTPException(status_code=503, detail="Data preview temporarily unavailable")
+    # Only fields from the public trend dataset are exposed; never return raw
+    # database credentials, metadata secrets or private columns.
+    from fastapi.encoders import jsonable_encoder
+    visible = []
+    for record in rows:
+        visible.append({k: v for k, v in dict(record).items()
+                        if not any(term in k.lower() for term in
+                                   ("password", "token", "secret", "credential", "api_key"))})
+    return jsonable_encoder({"layer": layer, "table": tables[layer], "row_count": count, "rows": visible})
+
+
 @api.post("/demo/trigger")
 async def demo_trigger(
     error_type: str = Query("row_count_anomaly"),

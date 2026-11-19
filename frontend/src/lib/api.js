@@ -15,3 +15,5 @@ export const getPipeline = (id) => api.get(`/pipelines/${id}`).then((r) => r.dat
 export const getFailures = (id) => api.get(`/pipelines/${id}/failures`).then((r) => r.data);
 export const getLineage = (id) => api.get(`/pipelines/${id}/lineage`).then((r) => r.data);
 export const getAudit = (params) => api.get("/audit", { params }).then((r) => r.data);
+
+export const getFlowPreview = (layer) => api.get(`/data-flow/preview`, {params: {layer}}).then(r => r.data);
