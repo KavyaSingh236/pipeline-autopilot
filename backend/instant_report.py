@@ -982,14 +982,7 @@ async def build_instant_pdf(client=None):
 
     story.append(Spacer(1, 16))
 
-    story.append(panel(
-        [[paragraph(
-            "REPORTING NOTE: All numerical metrics are "
-            "derived from recorded database values. "
-            "This report does not estimate uptime, "
-            "recovery duration, or missing historical data.",
-            "PA_Small",
-        )]],
+    
         widths=[CONTENT_WIDTH],
         background="#F4F0FF",
     ))
