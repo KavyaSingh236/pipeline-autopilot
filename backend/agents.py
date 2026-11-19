@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import json
@@ -37,7 +38,7 @@ def model_name() -> str:
 
 
 async def _chat(client, system: str, user: str, model: str | None = None) -> dict | None:
-    key = os.getenv("GROQ_API_KEY", "")
+    key = os.getenv("GROQ_API_KEY", "").strip()
     if not key or client is None:
         return None
 
@@ -75,8 +76,8 @@ MODEL_STATUS = {"gemini": {"last_ok": None, "last_error": None}, "remediation": 
 
 
 async def diagnose_with_gemini(client, error_type: str, error_log: str, findings: list[dict]) -> dict:
-    key = os.getenv("GEMINI_API_KEY", "")
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
     if not key or client is None:
         MODEL_STATUS["gemini"]["last_error"] = "GEMINI_API_KEY not configured"
         return {}
