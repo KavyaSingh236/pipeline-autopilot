@@ -10,6 +10,8 @@ from collections import Counter
 from datetime import datetime, timezone, timedelta
 from xml.sax.saxutils import escape
 
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -83,10 +85,22 @@ def labelize(value):
 # --------------------------------------------------
 
 styles = getSampleStyleSheet()
+# Use a modern, legible font where available, with safe fallback.
+from pathlib import Path as _Path
+_font_dir = _Path('/usr/share/fonts/truetype/dejavu')
+if (_font_dir / 'DejaVuSans.ttf').exists():
+    pdfmetrics.registerFont(TTFont('PA-Regular', str(_font_dir / 'DejaVuSans.ttf')))
+    pdfmetrics.registerFont(TTFont('PA-Bold', str(_font_dir / 'DejaVuSans-Bold.ttf')))
+    pdfmetrics.registerFontFamily('PA-Regular', normal='PA-Regular', bold='PA-Bold', italic='PA-Regular', boldItalic='PA-Bold')
+else:
+    pdfmetrics.registerFontFamily('Helvetica', normal='Helvetica', bold='Helvetica-Bold')
+PA_REGULAR = 'PA-Regular' if 'PA-Regular' in pdfmetrics.getRegisteredFontNames() else 'Helvetica'
+PA_BOLD = 'PA-Bold' if 'PA-Bold' in pdfmetrics.getRegisteredFontNames() else 'Helvetica-Bold'
+
 
 styles.add(ParagraphStyle(
     name="PA_Brand",
-    fontName="Helvetica-Bold",
+    fontName=PA_BOLD,
     fontSize=15,
     leading=19,
     textColor=NAVY,
@@ -95,35 +109,35 @@ styles.add(ParagraphStyle(
 
 styles.add(ParagraphStyle(
     name="PA_Title",
-    fontName="Helvetica-Bold",
-    fontSize=23,
-    leading=29,
+    fontName=PA_BOLD,
+    fontSize=20,
+    leading=25,
     textColor=NAVY,
-    spaceAfter=12,
+    spaceAfter=6,
 ))
 
 styles.add(ParagraphStyle(
     name="PA_Section",
-    fontName="Helvetica-Bold",
+    fontName=PA_BOLD,
     fontSize=13,
     leading=18,
     textColor=NAVY,
-    spaceBefore=12,
-    spaceAfter=9,
+    spaceBefore=9,
+    spaceAfter=6,
 ))
 
 styles.add(ParagraphStyle(
     name="PA_Body",
-    fontName="Helvetica",
-    fontSize=9.2,
-    leading=15,
+    fontName=PA_REGULAR,
+    fontSize=8.8,
+    leading=13,
     textColor=NAVY,
-    spaceAfter=7,
+    spaceAfter=4,
 ))
 
 styles.add(ParagraphStyle(
     name="PA_Small",
-    fontName="Helvetica",
+    fontName=PA_REGULAR,
     fontSize=8,
     leading=12,
     textColor=GREY,
@@ -132,7 +146,7 @@ styles.add(ParagraphStyle(
 
 styles.add(ParagraphStyle(
     name="PA_CardLabel",
-    fontName="Helvetica",
+    fontName=PA_REGULAR,
     fontSize=8,
     leading=11,
     textColor=GREY,
@@ -141,7 +155,7 @@ styles.add(ParagraphStyle(
 
 styles.add(ParagraphStyle(
     name="PA_CardValue",
-    fontName="Helvetica-Bold",
+    fontName=PA_BOLD,
     fontSize=20,
     leading=26,
     textColor=NAVY,
@@ -150,7 +164,7 @@ styles.add(ParagraphStyle(
 
 styles.add(ParagraphStyle(
     name="PA_Table",
-    fontName="Helvetica",
+    fontName=PA_REGULAR,
     fontSize=8,
     leading=12,
     textColor=NAVY,
@@ -183,8 +197,8 @@ def panel(rows, widths=None, background="#F6F3FF", padding=12):
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("LEFTPADDING", (0, 0), (-1, -1), padding),
         ("RIGHTPADDING", (0, 0), (-1, -1), padding),
-        ("TOPPADDING", (0, 0), (-1, -1), 12),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
     ]))
 
     return table
@@ -209,8 +223,8 @@ def kpi_cards(story, items):
         card.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, -1), PALE),
             ("BOX", (0, 0), (-1, -1), 0.6, BORDER),
-            ("TOPPADDING", (0, 0), (-1, 0), 12),
-            ("BOTTOMPADDING", (0, -1), (-1, -1), 12),
+            ("TOPPADDING", (0, 0), (-1, 0), 7),
+            ("BOTTOMPADDING", (0, -1), (-1, -1), 7),
         ]))
 
         cards.append(card)
@@ -228,7 +242,7 @@ def kpi_cards(story, items):
     ]))
 
     story.append(outer)
-    story.append(Spacer(1, 12))
+    story.append(Spacer(1, 7))
 
 
 # --------------------------------------------------
@@ -239,7 +253,7 @@ def recovery_trend(days):
     """Actual daily detected and recovered counts."""
 
     width = 485
-    height = 195
+    height = 165
     drawing = Drawing(width, height)
 
     maximum = max(
@@ -249,7 +263,7 @@ def recovery_trend(days):
     left = 42
     bottom = 37
     plot_width = 420
-    plot_height = 115
+    plot_height = 95
 
     for i in range(5):
         y = bottom + i * plot_height / 4
@@ -343,7 +357,7 @@ def recovery_trend(days):
 # --------------------------------------------------
 
 def incident_donut(items):
-    drawing = Drawing(485, 180)
+    drawing = Drawing(485, 155)
 
     total = sum(value for _, value in items)
 
@@ -388,7 +402,7 @@ def incident_donut(items):
         center_x,
         center_y + 3,
         number(total),
-        fontName="Helvetica-Bold",
+        fontName=PA_BOLD,
         fontSize=16,
         textAnchor="middle",
         fillColor=NAVY,
@@ -459,7 +473,7 @@ def quality_bar(share):
         470, 39,
         f"{value:.1f}%",
         textAnchor="end",
-        fontName="Helvetica-Bold",
+        fontName=PA_BOLD,
         fontSize=11,
         fillColor=GREEN,
     ))
@@ -635,8 +649,8 @@ async def build_instant_pdf(client=None):
         pagesize=(8.5 * inch, 11 * inch),
         leftMargin=50,
         rightMargin=50,
-        topMargin=48,
-        bottomMargin=49,
+        topMargin=40,
+        bottomMargin=42,
         title="Pipeline Autopilot - Instant Report",
         author="Pipeline Autopilot",
     )
@@ -667,7 +681,7 @@ async def build_instant_pdf(client=None):
             "PA_Small",
         ))
 
-        story.append(Spacer(1, 12))
+        story.append(Spacer(1, 7))
 
     # ==============================================
     # PAGE 1 — EXECUTIVE OVERVIEW
@@ -706,7 +720,7 @@ async def build_instant_pdf(client=None):
         padding=17,
     ))
 
-    story.append(Spacer(1, 14))
+    story.append(Spacer(1, 8))
 
     kpi_cards(story, [
         ("Healthy Stages", f"{healthy}/{len(pipelines)}"),
@@ -761,27 +775,8 @@ async def build_instant_pdf(client=None):
         "PA_Small",
     ))
 
-    story.append(Spacer(1, 8))
-
-    section(story, "Operational Performance")
-
-    if recovery_rate is not None:
-        performance = (
-            f"{recovery_rate:.1f}% of incident records "
-            "in the reporting window have an "
-            "auto-recovered outcome."
-        )
-    else:
-        performance = (
-            "No incidents were recorded during "
-            "the reporting window."
-        )
-
-    story.append(panel(
-        [[paragraph(performance)]],
-        widths=[CONTENT_WIDTH],
-        background="#EFFAF7",
-    ))
+    # Operational performance is already represented by the recovery KPI and
+    # executive summary; avoid duplicating it in a separate oversized block.
 
     # ==============================================
     # PAGE 2 — DATA QUALITY & INCIDENT ANALYSIS
@@ -861,35 +856,15 @@ async def build_instant_pdf(client=None):
         ("LINEBELOW", (0, 0), (-1, -1),
          0.4, BORDER),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 9),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
         ("LEFTPADDING", (0, 0), (-1, -1), 12),
     ]))
 
     story.append(quality_table)
 
-    section(story, "Recent Incident Highlights")
-
-    if highlights:
-        for incident in highlights[:4]:
-            name = labelize(incident.get("error_type"))
-            status = labelize(incident.get("status"))
-            outcome = str(incident.get("outcome") or "")
-
-            story.append(KeepTogether([
-                rich(
-                    f"<b>{safe(name)}</b>  |  {safe(status)}"
-                ),
-                paragraph(
-                    outcome[:190] or
-                    "No additional outcome details recorded.",
-                    "PA_Small",
-                ),
-            ]))
-    else:
-        story.append(paragraph(
-            "No recent incidents were recorded."
-        ))
+    # Incident-level detail is available in the Audit Log. Keep the report
+    # focused on aggregate insights rather than spilling a table to a new page.
 
     # ==============================================
     # PAGE 3 — BUSINESS INSIGHTS
