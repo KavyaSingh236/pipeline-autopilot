@@ -91,7 +91,7 @@ function ReactRow({r,expanded,toggle}) {
             </tr>
             {expanded && <tr><td colSpan={6} className="px-6 py-5 bg-[#10151B] border-b border-[#00E5FF]/30">
               <div className="grid md:grid-cols-2 gap-5 text-xs font-mono break-words">
-                {[["Error detected", r.description], ["Root cause", r.root_cause], ["Diagnosis source", r.model || "Not recorded"], ["Recommended fix", r.proposed_fix], ["Executed action", r.action], ["Recovery outcome", r.outcome], ["Validation evidence / error log", r.error_log], ["Downstream impact", r.downstream_impact], ["Historical approval risk", r.risk_if_approved], ["Historical rejection risk", r.risk_if_rejected], ["Affected rows", r.rows_affected]].filter(([,v]) => v !== null && v !== undefined && v !== "").map(([label,value]) => (
+                {[["Error detected", r.description], ["Root cause", r.root_cause], ["Diagnosis source", r.model || "Not recorded"], ["Recommended fix", r.proposed_fix], ["Executed action", r.action], ["Recovery outcome", r.outcome], ["Validation evidence / error log", r.error_log], ["Downstream impact", r.downstream_impact], ["Affected rows", r.rows_affected]].filter(([,v]) => v !== null && v !== undefined && v !== "").map(([label,value]) => (
                   <div key={label}><div className="uppercase tracking-widest text-[10px] text-[#00E5FF]/70 mb-2">{label}</div><div className="text-white/75 whitespace-pre-wrap">{String(value)}</div></div>
                 ))}
               </div>
