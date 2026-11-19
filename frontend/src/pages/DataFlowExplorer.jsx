@@ -52,13 +52,13 @@ export default function DataFlowExplorer({lastEvent}) {
       </div>
       <p className="pa-muted pa-flow-note"><Info size={14}/> Gold has two output tables. Counts represent current table contents, not the latest batch size. Select any stage for details.</p>
     </section>
-    <section className="pa-panel pa-flow-detail"><div className="pa-panel-heading"><h2><stage.icon size={21}/> {stage.title} · What happens here?</h2><span className="pa-muted">Read-only live exploration</span></div><p>{stage.description}</p>
+    {!'source,gold_regions'.split(',').includes(selected) && <section className="pa-panel pa-flow-detail"><div className="pa-panel-heading"><h2><stage.icon size={21}/> {stage.title} · What happens here?</h2><span className="pa-muted">Read-only live exploration</span></div><p>{stage.description}</p>
       <div className="pa-flow-stat"><div><small>Storage / source</small><strong>{preview?.table|| (selected==='source'?'Google Trends (BigQuery)':stage.subtitle)}</strong></div><div><small>Rows currently stored</small><strong>{selected==='source'?'Not stored locally':format(preview?.row_count ?? node?.rows)}</strong></div></div>
       {!['source','gold_regions'].includes(selected) && <>
       <div className="pa-panel-heading"><h2><Database size={19}/> Sample records</h2><span className="pa-muted">Up to 5 real rows · no edits</span></div>
       {loading?<div className="pa-empty">Loading a live data preview…</div>:columns.length?<div className="pa-preview-scroll"><table className="pa-preview-table"><thead><tr>{columns.map(c=><th key={c}>{c.replaceAll('_',' ')}</th>)}</tr></thead><tbody>{preview.rows.map((r,i)=><tr key={i}>{columns.map(c=><td key={c} title={String(r[c]??'')}>{r[c]===null?'—':typeof r[c]==='object'?JSON.stringify(r[c]):String(r[c])}</td>)}</tr>)}</tbody></table></div>:<div className="pa-empty">No preview records are currently available for this layer.</div>}
       </>}
-    </section>
+    </section>}
     <p className="pa-muted pa-explorer-footer">Data previews are read-only. Detailed failures, diagnoses, recovery actions and evidence remain in <Link to="/audit">Audit Log <ArrowRight size={13}/></Link>.</p>
   </div>;
 }

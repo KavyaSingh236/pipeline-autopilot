@@ -143,3 +143,6 @@ body{background:#f7f5ff;color:#1d1c47;font-family:'Outfit',sans-serif}
 .pa-flow-step:hover .pa-flow-circle,.pa-flow-step.selected .pa-flow-circle{transform:scale(1.06);box-shadow:0 0 0 5px rgba(145,110,239,.1)}
 .pa-chart{min-height:260px}
 @media(prefers-reduced-motion:reduce){.pa-kpi,.pa-panel,.pa-summary-grid>div,.pa-activity-row,.pa-report-card,.pa-flow-stat>div,.pa-flow-circle{transition:none!important}.pa-kpi:hover,.pa-summary-grid>div:hover,.pa-report-card:hover,.pa-flow-step:hover{transform:none!important}}
+
+/* Compact animated chart range selector */
+.pa-trend-switch{display:flex;gap:5px;background:#f4f0ff;border-radius:12px;padding:4px}.pa-trend-switch button{border:0;background:transparent;color:#746a96;border-radius:9px;padding:7px 12px;font:inherit;font-size:12px;cursor:pointer;transition:background .2s,color .2s,transform .2s}.pa-trend-switch button:hover{transform:translateY(-1px)}.pa-trend-switch button.active{background:white;color:#6946df;box-shadow:0 2px 9px #6d51b526;font-weight:700}
