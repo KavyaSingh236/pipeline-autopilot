@@ -8,6 +8,7 @@ Compatible with: await build_instant_pdf(client=None)
 import io
 from collections import Counter
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from xml.sax.saxutils import escape
 
 from reportlab.pdfbase import pdfmetrics
@@ -17,22 +18,11 @@ from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import (
-    SimpleDocTemplate,
-    Paragraph,
-    Spacer,
-    Table,
-    TableStyle,
-    PageBreak,
-    KeepTogether,
+    SimpleDocTemplate, Paragraph, Spacer, Table,
+    TableStyle, PageBreak
 )
 from reportlab.graphics.shapes import (
-    Drawing,
-    Rect,
-    String,
-    Circle,
-    Line,
-    PolyLine,
-    Wedge,
+    Drawing, Rect, String, Circle, Line, PolyLine, Wedge
 )
 
 import db
@@ -52,7 +42,6 @@ PALE = colors.HexColor("#F4F0FF")
 BORDER = colors.HexColor("#E5DEFA")
 WHITE = colors.white
 
-PAGE_WIDTH = 612
 CONTENT_WIDTH = 512
 
 PALETTE = [
@@ -85,18 +74,41 @@ def labelize(value):
 # --------------------------------------------------
 
 styles = getSampleStyleSheet()
-# Use a modern, legible font where available, with safe fallback.
-from pathlib import Path as _Path
-_font_dir = _Path('/usr/share/fonts/truetype/dejavu')
-if (_font_dir / 'DejaVuSans.ttf').exists():
-    pdfmetrics.registerFont(TTFont('PA-Regular', str(_font_dir / 'DejaVuSans.ttf')))
-    pdfmetrics.registerFont(TTFont('PA-Bold', str(_font_dir / 'DejaVuSans-Bold.ttf')))
-    pdfmetrics.registerFontFamily('PA-Regular', normal='PA-Regular', bold='PA-Bold', italic='PA-Regular', boldItalic='PA-Bold')
-else:
-    pdfmetrics.registerFontFamily('Helvetica', normal='Helvetica', bold='Helvetica-Bold')
-PA_REGULAR = 'PA-Regular' if 'PA-Regular' in pdfmetrics.getRegisteredFontNames() else 'Helvetica'
-PA_BOLD = 'PA-Bold' if 'PA-Bold' in pdfmetrics.getRegisteredFontNames() else 'Helvetica-Bold'
 
+font_dir = Path("/usr/share/fonts/truetype/dejavu")
+
+if (font_dir / "DejaVuSans.ttf").exists():
+    pdfmetrics.registerFont(
+        TTFont("PA-Regular", str(font_dir / "DejaVuSans.ttf"))
+    )
+    pdfmetrics.registerFont(
+        TTFont("PA-Bold", str(font_dir / "DejaVuSans-Bold.ttf"))
+    )
+    pdfmetrics.registerFontFamily(
+        "PA-Regular",
+        normal="PA-Regular",
+        bold="PA-Bold",
+        italic="PA-Regular",
+        boldItalic="PA-Bold",
+    )
+else:
+    pdfmetrics.registerFontFamily(
+        "Helvetica",
+        normal="Helvetica",
+        bold="Helvetica-Bold",
+    )
+
+PA_REGULAR = (
+    "PA-Regular"
+    if "PA-Regular" in pdfmetrics.getRegisteredFontNames()
+    else "Helvetica"
+)
+
+PA_BOLD = (
+    "PA-Bold"
+    if "PA-Bold" in pdfmetrics.getRegisteredFontNames()
+    else "Helvetica-Bold"
+)
 
 styles.add(ParagraphStyle(
     name="PA_Brand",
@@ -180,15 +192,11 @@ def rich(text, style="PA_Body"):
 
 
 # --------------------------------------------------
-# REUSABLE DESIGN COMPONENTS
+# REUSABLE COMPONENTS
 # --------------------------------------------------
 
 def panel(rows, widths=None, background="#F6F3FF", padding=12):
-    table = Table(
-        rows,
-        colWidths=widths,
-        hAlign="LEFT",
-    )
+    table = Table(rows, colWidths=widths, hAlign="LEFT")
 
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1),
@@ -246,108 +254,87 @@ def kpi_cards(story, items):
 
 
 # --------------------------------------------------
-# LINE GRAPH
+# TWO SEPARATE RECOVERY LINE GRAPHS
 # --------------------------------------------------
 
 def recovery_trend(days):
-    """Actual daily detected and recovered counts."""
+    """Separated charts prevent identical series obscuring each other."""
 
-    width = 485
-    height = 165
+    width, height = 485, 188
     drawing = Drawing(width, height)
 
-    maximum = max(
-        [max(row[1], row[2]) for row in days] or [1]
-    ) or 1
-
-    left = 42
-    bottom = 37
+    left = 43
     plot_width = 420
-    plot_height = 95
 
-    for i in range(5):
-        y = bottom + i * plot_height / 4
+    xs = [
+        left + i * plot_width / max(1, len(days) - 1)
+        for i in range(len(days))
+    ]
 
-        drawing.add(Line(
-            left, y,
-            left + plot_width, y,
-            strokeColor=BORDER,
-            strokeWidth=0.7,
-            strokeDashArray=[3, 4],
-        ))
+    series = [
+        ("DETECTED INCIDENTS", 1, PURPLE, 108),
+        ("AUTO-RECOVERED", 2, GREEN, 30),
+    ]
+
+    for title, index, color, base in series:
+        maximum = max([row[index] for row in days] or [1]) or 1
 
         drawing.add(String(
-            5, y - 3,
-            str(round(maximum * i / 4)),
-            fontSize=8,
-            fillColor=GREY,
+            left, base + 58, title,
+            fontName="Helvetica-Bold",
+            fontSize=9,
+            fillColor=color,
         ))
 
-    if days:
-        xs = [
-            left + i * plot_width / max(1, len(days) - 1)
-            for i in range(len(days))
-        ]
+        for tick in range(3):
+            y = base + tick * 22
 
-        for index, color in [
-            (1, PURPLE),
-            (2, GREEN),
-        ]:
-            coordinates = []
+            drawing.add(Line(
+                left, y,
+                left + plot_width, y,
+                strokeColor=BORDER,
+                strokeWidth=0.7,
+                strokeDashArray=[3, 4],
+            ))
 
-            for i, row in enumerate(days):
-                x = xs[i]
-                y = bottom + plot_height * row[index] / maximum
-
-                coordinates.extend([x, y])
-
-                drawing.add(Circle(
-                    x, y, 3.3,
-                    fillColor=color,
-                    strokeColor=WHITE,
-                    strokeWidth=0.8,
-                ))
-
-            if len(days) > 1:
-                drawing.add(PolyLine(
-                    coordinates,
-                    strokeColor=color,
-                    strokeWidth=2.8,
-                    fillColor=None,
-                ))
-
-        for i, row in enumerate(days):
             drawing.add(String(
-                xs[i] - 15,
-                19,
-                row[0],
+                5, y - 3,
+                str(round(maximum * tick / 2)),
                 fontSize=8,
                 fillColor=GREY,
             ))
 
-    drawing.add(Line(
-        140, 180, 156, 180,
-        strokeColor=PURPLE,
-        strokeWidth=3,
-    ))
-    drawing.add(String(
-        162, 176,
-        "Detected incidents",
-        fontSize=9,
-        fillColor=NAVY,
-    ))
+        coords = []
 
-    drawing.add(Line(
-        285, 180, 301, 180,
-        strokeColor=GREEN,
-        strokeWidth=3,
-    ))
-    drawing.add(String(
-        307, 176,
-        "Auto-recovered",
-        fontSize=9,
-        fillColor=NAVY,
-    ))
+        for i, row in enumerate(days):
+            x = xs[i]
+            y = base + 44 * row[index] / maximum
+
+            coords.extend([x, y])
+
+            drawing.add(Circle(
+                x, y, 3,
+                fillColor=color,
+                strokeColor=WHITE,
+                strokeWidth=0.7,
+            ))
+
+        if len(days) > 1:
+            drawing.add(PolyLine(
+                coords,
+                strokeColor=color,
+                strokeWidth=2.7,
+                fillColor=None,
+            ))
+
+    for i, row in enumerate(days):
+        drawing.add(String(
+            xs[i] - 15,
+            10,
+            row[0],
+            fontSize=8,
+            fillColor=GREY,
+        ))
 
     return drawing
 
@@ -437,7 +424,7 @@ def incident_donut(items):
 
 
 # --------------------------------------------------
-# QUALITY VISUAL
+# DATA QUALITY GRAPH
 # --------------------------------------------------
 
 def quality_bar(share):
@@ -455,7 +442,8 @@ def quality_bar(share):
 
     if value > 0:
         drawing.add(Rect(
-            0, 14, 470 * value / 100, 17,
+            0, 14,
+            470 * value / 100, 17,
             rx=8,
             ry=8,
             fillColor=GREEN,
@@ -492,7 +480,6 @@ async def build_instant_pdf(client=None):
     pool = await db.get_pool()
 
     async with pool.acquire() as conn:
-
         pipelines = [
             dict(row)
             for row in await conn.fetch(
@@ -565,9 +552,7 @@ async def build_instant_pdf(client=None):
             )
         ]
 
-    # ----------------------------------------------
-    # METRIC CALCULATIONS
-    # ----------------------------------------------
+    # METRICS
 
     healthy = sum(
         p["status"] == "healthy"
@@ -638,9 +623,7 @@ async def build_instant_pdf(client=None):
             record.get("recovered", 0),
         ))
 
-    # ----------------------------------------------
     # DOCUMENT SETUP
-    # ----------------------------------------------
 
     buffer = io.BytesIO()
 
@@ -775,9 +758,6 @@ async def build_instant_pdf(client=None):
         "PA_Small",
     ))
 
-    # Operational performance is already represented by the recovery KPI and
-    # executive summary; avoid duplicating it in a separate oversized block.
-
     # ==============================================
     # PAGE 2 — DATA QUALITY & INCIDENT ANALYSIS
     # ==============================================
@@ -862,9 +842,6 @@ async def build_instant_pdf(client=None):
     ]))
 
     story.append(quality_table)
-
-    # Incident-level detail is available in the Audit Log. Keep the report
-    # focused on aggregate insights rather than spilling a table to a new page.
 
     # ==============================================
     # PAGE 3 — BUSINESS INSIGHTS
@@ -994,9 +971,7 @@ async def build_instant_pdf(client=None):
         background="#F4F0FF",
     ))
 
-    # ----------------------------------------------
     # PAGE DECORATION
-    # ----------------------------------------------
 
     def decorate(canvas, document):
         canvas.saveState()
