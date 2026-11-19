@@ -36,7 +36,7 @@ export default function AuditLogPage({ lastEvent }) {
   useEffect(() => { if (lastEvent) load(); }, [lastEvent, load]);
 
   return (
-    <div>
+    <div className="pa-audit-dark">
       <div className="text-[10px] tracking-[0.3em] uppercase text-white/40 mb-3">Compliance Trail</div>
       <h1 className="font-display text-4xl sm:text-5xl tracking-tighter uppercase font-light leading-none mb-8">
         Audit Log

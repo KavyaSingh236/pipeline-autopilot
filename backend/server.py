@@ -12,6 +12,8 @@ import mailer
 import structlog
 from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Header, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
+from instant_report import build_instant_pdf
 from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 
@@ -392,6 +394,16 @@ async def toggle_alerts(body: AlertToggle):
         await conn.execute("UPDATE public.notification_settings SET enabled=$1 WHERE id=1", body.enabled)
     orchestrator.set_alerts_enabled(body.enabled)
     return {"enabled": body.enabled, "frequency": "weekly"}
+
+
+@api.get("/reports/instant")
+async def instant_report():
+    """Generate and download a factual, human-readable PDF from live records."""
+    pdf = await build_instant_pdf(orchestrator._client)
+    return Response(content=pdf, media_type="application/pdf", headers={
+        "Content-Disposition": "attachment; filename=Pipeline_Autopilot_Instant_Report.pdf",
+        "Cache-Control": "no-store",
+    })
 
 
 @api.post("/reports/weekly/send")

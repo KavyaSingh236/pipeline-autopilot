@@ -1,89 +1,36 @@
-import { useEffect, useState, useCallback } from "react";
-import { Link } from "react-router-dom";
-import { motion } from "framer-motion";
-import { AlertTriangle, ArrowRight, CheckCircle2 } from "lucide-react";
-import PipelineCard from "@/components/PipelineCard";
-import { getPipelines, getAudit } from "@/lib/api";
+import { useEffect, useState, useCallback, useMemo } from 'react';
+import { Link } from 'react-router-dom';
+import { Database, ShieldCheck, Zap, Clock3, Activity, CheckCircle2, AlertTriangle, TrendingUp, ArrowRight, GitBranch, ListChecks } from 'lucide-react';
+import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid, Legend } from 'recharts';
+import { getPipelines, getAudit } from '@/lib/api';
 
-export default function ControlTower({ lastEvent }) {
-  const [pipelines, setPipelines] = useState([]);
-  const [recent, setRecent] = useState([]);
-  const [now, setNow] = useState(new Date());
+const safeNumber = v => Number.isFinite(Number(v)) ? Number(v) : 0;
+const nice = n => safeNumber(n).toLocaleString();
+const stages = [{match:'ingest',title:'Ingest',subtitle:'Google Trends · BigQuery',Icon:Database},{match:'transform',title:'Transform',subtitle:'Bronze → Silver → Gold',Icon:GitBranch},{match:'validate',title:'Validate',subtitle:'Data quality checks',Icon:ShieldCheck}];
 
-  const load = useCallback(async () => {
-    try {
-      const [p, a] = await Promise.all([getPipelines(), getAudit({})]);
-      setPipelines(p);
-      setRecent(a.filter(r => ["auto_fixed", "recovery_failed"].includes(r.status)).slice(0, 5));
-    } catch (e) {}
-  }, []);
-
-  useEffect(() => { load(); }, [load]);
-  useEffect(() => {
-    const t = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(t);
-  }, []);
-  useEffect(() => { if (lastEvent) load(); }, [lastEvent, load]);
-
-  const recovered = recent.filter((r) => r.status === "auto_fixed").length;
-  const healthy = pipelines.filter((p) => p.status === "healthy").length;
-
-  return (
-    <div>
-      <div className="flex flex-col md:flex-row md:items-end justify-between gap-6 mb-10">
-        <div>
-          <div className="text-[10px] tracking-[0.3em] uppercase text-white/40 mb-3">Mission Control</div>
-          <h1 className="font-display text-4xl sm:text-5xl tracking-tighter uppercase font-light leading-none">
-            Control Tower
-          </h1>
-          <p className="text-sm text-white/50 mt-3 max-w-lg">
-            Real-time posture across the self-healing ETL. Failures are classified, recovery actions
-            applied autonomously, revalidated, and logged without human approval.
-          </p>
-        </div>
-        <div className="border border-white/10 bg-[#0A0A0A] px-6 py-4">
-          <div className="text-[9px] tracking-[0.2em] uppercase text-white/40">System Time · UTC</div>
-          <div className="font-mono text-2xl text-[#00E5FF] mt-1 tabular-nums">
-            {now.toISOString().slice(11, 19)}
-          </div>
-          <div className="flex gap-4 mt-2">
-            <Stat label="Healthy" value={`${healthy}/${pipelines.length}`} color="#00FF66" />
-            <Stat label="Recent Auto-Recovered" value={recovered} color="#00FF66" />
-          </div>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6" data-testid="pipeline-grid">
-        {pipelines.map((p, i) => (
-          <PipelineCard key={p.id} pipeline={p} index={i} />
-        ))}
-      </div>
-      <section className="mt-10 border border-white/10 bg-[#0A0A0A]" data-testid="recent-resolutions">
-        <div className="flex items-center justify-between border-b border-white/10 px-6 py-5 gap-4">
-          <div><h2 className="text-lg font-display uppercase tracking-wider">Recent Resolutions</h2>
-            <p className="text-xs text-white/40 mt-1">Latest five detected failures and their outcomes</p></div>
-          <Link to="/audit" className="text-[#00E5FF] text-xs font-mono uppercase flex items-center gap-2 hover:underline">View all <ArrowRight size={14}/></Link>
-        </div>
-        {recent.length === 0 ? <p className="p-6 text-sm text-white/40">No incidents recorded yet.</p> : recent.map(r => (
-          <Link to={`/audit?incident=${encodeURIComponent(r.id)}`} key={r.id} className="flex flex-wrap items-center gap-3 justify-between px-6 py-4 border-b border-white/5 hover:bg-white/5 transition-colors">
-            <div className="flex items-start gap-3 min-w-0">
-              {r.status === "recovery_failed" ? <AlertTriangle size={17} className="text-[#FF0055] shrink-0"/> : <CheckCircle2 size={17} className="text-[#00E5FF] shrink-0"/>}
-              <div className="min-w-0"><div className="text-sm text-white/90 font-medium">{(r.error_type || "Unknown error").replaceAll("_", " ")}</div>
-                <div className="text-xs text-white/50 mt-1 break-words">{r.outcome || r.explanation || r.proposed_fix || r.description || "Awaiting resolution"}</div>
-                <div className="text-[10px] text-white/30 mt-1 font-mono">{r.pipeline_id} · {r.created_at ? new Date(r.created_at).toLocaleString() : ""}</div></div>
-            </div><span className={`text-[10px] font-mono tracking-wider uppercase border px-2 py-1 ${r.status === "recovery_failed" ? "text-[#FF0055] border-[#FF0055]/50" : "text-[#00E5FF] border-[#00E5FF]/50"}`}>{r.status.replaceAll("_", " ")}</span>
-          </Link>
-        ))}
-      </section>
-    </div>
-  );
-}
-
-function Stat({ label, value, color }) {
-  return (
-    <div>
-      <div className="text-[9px] tracking-[0.2em] uppercase text-white/40">{label}</div>
-      <div className="font-mono text-sm mt-0.5" style={{ color }}>{value}</div>
-    </div>
-  );
+export default function ControlTower({lastEvent}) {
+ const [pipelines,setPipelines]=useState([]),[audit,setAudit]=useState([]),[error,setError]=useState('');
+ const load=useCallback(async()=>{try{const [p,a]=await Promise.all([getPipelines(),getAudit({})]);setPipelines(Array.isArray(p)?p:[]);setAudit(Array.isArray(a)?a:[]);setError('');}catch(e){setError('Live metrics are temporarily unavailable.');}},[]);
+ useEffect(()=>{load();const timer=setInterval(load,45000);return()=>clearInterval(timer)},[load]);
+ useEffect(()=>{if(lastEvent)load()},[lastEvent,load]);
+ const latest=pipelines.find(p=>String(p.dag_id||p.id).includes('ingest'))||pipelines[0];
+ const last=latest?.last_run||{};
+ const healthy=pipelines.filter(p=>p.status==='healthy').length;
+ const resolved=audit.filter(a=>a.status==='auto_fixed');
+ const unresolved=audit.filter(a=>a.status==='recovery_failed');
+ const chart=useMemo(()=>{const entries=[...audit].filter(a=>a.created_at).sort((a,b)=>new Date(a.created_at)-new Date(b.created_at)).slice(-70);const days={};entries.forEach(a=>{const key=new Date(a.created_at).toLocaleDateString(undefined,{month:'short',day:'numeric'});if(!days[key])days[key]={date:key,recovered:0,failed:0};if(a.status==='auto_fixed')days[key].recovered++;if(a.status==='recovery_failed')days[key].failed++;});return Object.values(days).slice(-7)},[audit]);
+ const processed=safeNumber(last.rows_processed),quarantined=safeNumber(last.rows_quarantined);
+ const quality=processed+quarantined>0?Math.round(100*processed/(processed+quarantined)):null;
+ const cards=[{label:'Rows Processed',value:latest?nice(processed):'—',note:'Latest ingest run',Icon:Database,kind:'blue'},{label:'Data Quality',value:quality===null?'—':`${quality}%`,note:'Latest ingest batch · usable share',Icon:ShieldCheck,kind:'mint'},{label:'Auto-Recoveries',value:nice(resolved.length),note:'Recent audit records',Icon:Zap,kind:'purple'},{label:'Pipeline Health',value:`${healthy}/${pipelines.length}`,note:'Healthy monitored stages',Icon:Clock3,kind:'peach'}];
+ return <div className="pa-dashboard">
+  <div className="pa-heading"><div><span className="pa-eyebrow">MISSION CONTROL</span><h1>Pipeline overview <span>✦</span></h1><p>See how your data is flowing, recovering, and performing—all in one place.</p></div><span className="pa-timestamp">Updated {new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}</span></div>
+  {error&&<div className="pa-warning">{error}</div>}
+  <div className="pa-kpis">{cards.map(({label,value,note,Icon,kind})=><div className={'pa-kpi '+kind} key={label}><div className="pa-kpi-icon"><Icon size={27}/></div><div><span>{label}</span><strong>{value}</strong><small>{note}</small></div></div>)}</div>
+  <div className="pa-dashboard-grid">
+   <section className="pa-panel pa-health"><div className="pa-panel-heading"><h2><Activity size={21}/> Pipeline Health</h2><span className={'pa-health-pill '+(healthy===pipelines.length&&pipelines.length?'ok':'attention')}>{healthy===pipelines.length&&pipelines.length?'✓ All stages healthy':'Monitoring stages'}</span></div><div className="pa-stages">{stages.map(({match,title,subtitle,Icon},i)=>{const p=pipelines.find(x=>String(x.dag_id||x.id).includes(match));return <div className="pa-stage-wrap" key={title}><div className={'pa-stage stage-'+match}><div className="pa-stage-icon"><Icon size={30}/></div><strong>{title}</strong><small>{subtitle}</small><span className={p?.status==='healthy'?'pa-stage-good':'pa-stage-bad'}>{p?(p.status==='healthy'?'✓ Healthy':p.status):'No data'}</span></div>{i<2&&<span className="pa-stage-arrow">➜</span>}</div>})}</div><p className="pa-muted pa-stage-foot">A single live view of your ETL stages. Full incident evidence is in Audit Log.</p></section>
+   <section className="pa-panel pa-summary"><div className="pa-panel-heading"><h2><ListChecks size={21}/> Run Summary</h2><span className="pa-muted">All recorded runs</span></div><div className="pa-summary-grid"><div><CheckCircle2 size={22}/><small>Recorded Runs</small><strong>{nice(pipelines.reduce((n,p)=>n+safeNumber(p.total_runs),0))}</strong></div><div><ShieldCheck size={22}/><small>Healthy Stages</small><strong>{healthy}/{pipelines.length}</strong></div><div><Zap size={22}/><small>Auto-Recoveries*</small><strong>{nice(resolved.length)}</strong></div><div><AlertTriangle size={22}/><small>Failed Recoveries*</small><strong>{nice(unresolved.length)}</strong></div></div><p className="pa-muted pa-summary-foot">*Based on the latest {audit.length} audit entries; historical failures may already be resolved.</p></section>
+   <section className="pa-panel pa-trend"><div className="pa-panel-heading"><h2><TrendingUp size={21}/> Recovery Activity Trend</h2><span className="pa-muted">Recent audit dates</span></div>{chart.length?<div className="pa-chart"><ResponsiveContainer width="100%" height="100%"><AreaChart data={chart} margin={{top:10,right:12,left:-24,bottom:0}}><defs><linearGradient id="paGreen" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#39cba0" stopOpacity=".25"/><stop offset="100%" stopColor="#39cba0" stopOpacity="0"/></linearGradient></defs><CartesianGrid stroke="#eae7f5" strokeDasharray="4 4"/><XAxis dataKey="date" tick={{fontSize:11,fill:'#77758c'}} axisLine={false} tickLine={false}/><YAxis allowDecimals={false} tick={{fontSize:11,fill:'#77758c'}} axisLine={false} tickLine={false}/><Tooltip/><Legend/><Area name="Auto-recovered" type="monotone" dataKey="recovered" stroke="#19b888" strokeWidth={3} fill="url(#paGreen)"/><Area name="Recovery failed" type="monotone" dataKey="failed" stroke="#a88af0" strokeWidth={2} fill="transparent"/></AreaChart></ResponsiveContainer></div>:<div className="pa-empty">Recovery trends will appear when audit records are available.</div>}<p className="pa-muted pa-summary-foot">Actual incident counts, not illustrative or hardcoded metrics.</p></section>
+   <section className="pa-panel pa-activity"><div className="pa-panel-heading"><h2><Zap size={21}/> Recent Activity</h2><Link to="/audit">View details <ArrowRight size={15}/></Link></div><div className="pa-activity-list">{audit.slice(0,4).map(r=><div className="pa-activity-row" key={r.id}><span className={'pa-activity-mark '+(r.status==='auto_fixed'?'good':'warn')}>{r.status==='auto_fixed'?'✓':'!'}</span><div><strong>{(r.error_type||'Pipeline event').replaceAll('_',' ')}</strong><small>{r.status==='auto_fixed'?'Automatically recovered':r.status==='recovery_failed'?'Recovery could not be verified':(r.status||'Recorded').replaceAll('_',' ')} · {r.created_at?new Date(r.created_at).toLocaleString():''}</small></div></div>)}{!audit.length&&<div className="pa-empty">No recorded incidents yet.</div>}</div></section>
+  </div>
+ </div>
 }
