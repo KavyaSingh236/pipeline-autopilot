@@ -32,7 +32,7 @@ export default function DataFlowExplorer({lastEvent}) {
   useEffect(()=>{loadFlow();const timer=setInterval(loadFlow,45000);return()=>clearInterval(timer);},[loadFlow]);
   useEffect(()=>{if(lastEvent)loadFlow()},[lastEvent,loadFlow]);
   useEffect(()=>{
-    if(selected==='source'){setPreview(null);return;}
+    if(selected==='source'||selected==='gold_regions'){setPreview(null);return;}
     let active=true;
     setLoading(true);setPreview(null);
     getFlowPreview(selected).then(x=>{if(active){setPreview(x);setError('');}}).catch(()=>{if(active)setError('Preview temporarily unavailable; lineage counts may still be visible.');}).finally(()=>{if(active)setLoading(false);});
@@ -54,8 +54,10 @@ export default function DataFlowExplorer({lastEvent}) {
     </section>
     <section className="pa-panel pa-flow-detail"><div className="pa-panel-heading"><h2><stage.icon size={21}/> {stage.title} · What happens here?</h2><span className="pa-muted">Read-only live exploration</span></div><p>{stage.description}</p>
       <div className="pa-flow-stat"><div><small>Storage / source</small><strong>{preview?.table|| (selected==='source'?'Google Trends (BigQuery)':stage.subtitle)}</strong></div><div><small>Rows currently stored</small><strong>{selected==='source'?'Not stored locally':format(preview?.row_count ?? node?.rows)}</strong></div></div>
+      {!['source','gold_regions'].includes(selected) && <>
       <div className="pa-panel-heading"><h2><Database size={19}/> Sample records</h2><span className="pa-muted">Up to 5 real rows · no edits</span></div>
-      {selected==='source'?<div className="pa-empty">Select Bronze to see the records after they have been ingested from BigQuery.</div>:loading?<div className="pa-empty">Loading a live data preview…</div>:columns.length?<div className="pa-preview-scroll"><table className="pa-preview-table"><thead><tr>{columns.map(c=><th key={c}>{c.replaceAll('_',' ')}</th>)}</tr></thead><tbody>{preview.rows.map((r,i)=><tr key={i}>{columns.map(c=><td key={c} title={String(r[c]??'')}>{r[c]===null?'—':typeof r[c]==='object'?JSON.stringify(r[c]):String(r[c])}</td>)}</tr>)}</tbody></table></div>:<div className="pa-empty">No preview records are currently available for this layer.</div>}
+      {loading?<div className="pa-empty">Loading a live data preview…</div>:columns.length?<div className="pa-preview-scroll"><table className="pa-preview-table"><thead><tr>{columns.map(c=><th key={c}>{c.replaceAll('_',' ')}</th>)}</tr></thead><tbody>{preview.rows.map((r,i)=><tr key={i}>{columns.map(c=><td key={c} title={String(r[c]??'')}>{r[c]===null?'—':typeof r[c]==='object'?JSON.stringify(r[c]):String(r[c])}</td>)}</tr>)}</tbody></table></div>:<div className="pa-empty">No preview records are currently available for this layer.</div>}
+      </>}
     </section>
     <p className="pa-muted pa-explorer-footer">Data previews are read-only. Detailed failures, diagnoses, recovery actions and evidence remain in <Link to="/audit">Audit Log <ArrowRight size={13}/></Link>.</p>
   </div>;

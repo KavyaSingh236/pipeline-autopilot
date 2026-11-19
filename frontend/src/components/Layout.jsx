@@ -10,6 +10,6 @@ export default function Layout({ children, connected }) {
       <nav className="pa-nav">{nav.map(({to,label,Icon})=><Link key={to} to={to} className={(pathname===to?'active ':'')+'pa-nav-item'}><Icon size={20}/>{label}</Link>)}</nav>
       <div className="pa-side-art"><DatabaseZap size={76} strokeWidth={1.1}/><div>Smarter Pipelines.<br/>Healthier Data. ♡</div></div>
     </aside>
-    <div className="pa-main"><header className="pa-topbar"><div className="pa-top-title">Pipeline Autopilot <span>✦</span><small>Autonomous ETL Monitoring & Recovery</small></div><div className="pa-top-right"><span className={'pa-live '+(connected?'online':'offline')}><span className="pa-dot"/>{connected?'Live':'Connecting'}</span><span className="pa-updated">{new Date().toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'})}</span><div className="pa-avatar">PA</div></div></header><main className="pa-content">{children}</main></div>
+    <div className="pa-main"><header className="pa-topbar"><div className="pa-top-title">Pipeline Autopilot <span>✦</span><small>Autonomous ETL Monitoring & Recovery</small></div><div className="pa-top-right"><span className={'pa-live '+(connected?'online':'offline')}><span className="pa-dot"/>{connected?'Live':'Connecting'}</span><span className="pa-updated">{new Date().toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'})}</span></div></header><main className="pa-content">{children}</main></div>
   </div>;
 }

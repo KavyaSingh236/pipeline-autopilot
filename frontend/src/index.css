@@ -132,3 +132,14 @@ body{background:#f7f5ff;color:#1d1c47;font-family:'Outfit',sans-serif}
 .pa-explorer-footer{margin:17px 0}.pa-explorer-footer a{display:inline-flex;align-items:center;color:#7957dc;gap:3px}
 @media(max-width:760px){.pa-flow-step-wrap{min-width:132px}.pa-flow-stat{grid-template-columns:1fr}.pa-panel-heading{flex-wrap:wrap}.pa-explore-link{margin-left:0}}
 @media(prefers-reduced-motion:reduce){.pa-flow-connector{animation:none}.pa-flow-step{transition:none}.pa-flow-step:hover{transform:none}}
+
+/* Final restrained motion system — hover emphasis without distracting from live metrics */
+.pa-kpi,.pa-panel,.pa-summary-grid>div,.pa-activity-row,.pa-report-card,.pa-flow-stat>div{transition:transform .28s ease,box-shadow .28s ease,border-color .28s ease,background-color .28s ease}
+.pa-kpi:hover,.pa-summary-grid>div:hover,.pa-report-card:hover{transform:translateY(-3px);box-shadow:0 12px 32px rgba(108,83,191,.13);border-color:#d9cbff}
+.pa-panel:hover{box-shadow:0 10px 32px rgba(89,69,166,.09);border-color:#ded5fa}
+.pa-activity-row:hover{background:#faf8ff}
+.pa-flow-stat>div:hover{background:#f0eaff}
+.pa-flow-circle{transition:transform .3s ease,box-shadow .3s ease}
+.pa-flow-step:hover .pa-flow-circle,.pa-flow-step.selected .pa-flow-circle{transform:scale(1.06);box-shadow:0 0 0 5px rgba(145,110,239,.1)}
+.pa-chart{min-height:260px}
+@media(prefers-reduced-motion:reduce){.pa-kpi,.pa-panel,.pa-summary-grid>div,.pa-activity-row,.pa-report-card,.pa-flow-stat>div,.pa-flow-circle{transition:none!important}.pa-kpi:hover,.pa-summary-grid>div:hover,.pa-report-card:hover,.pa-flow-step:hover{transform:none!important}}
